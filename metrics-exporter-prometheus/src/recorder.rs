@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::error::Error;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -16,6 +17,30 @@ pub(crate) struct Inner {
     pub distribution_builder: DistributionBuilder,
     pub descriptions: RwLock<HashMap<String, &'static str>>,
     pub global_labels: HashMap<String, String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct Export<'a, T: serde::Serialize> {
+    name: &'a str,
+    value: T,
+    tags: HashMap<&'a str, String>,
+}
+
+impl<'a, T: serde::Serialize> Export<'a, T> {
+    pub fn new(name: &'a str, value: T, labels: &'a Vec<String>, additional_label: &'a Option<String>) -> Self {
+        Export {
+            name,
+            value,
+            tags: labels.iter().chain(additional_label.iter()).map(|kv| {
+                let mut kvs = kv.split('=');
+                (kvs.next().unwrap_or_default(), kvs.next().unwrap_or_default().replace('"', ""))
+            }).collect()
+        }
+    }
+
+    pub fn to_json(&self) -> Result<String, Box<dyn std::error::Error>> {
+        serde_json::to_string(self).map_err(|e| e.into())
+    }
 }
 
 impl Inner {
@@ -83,6 +108,68 @@ impl Inner {
             gauges,
             distributions,
         }
+    }
+
+    pub fn render_nd_json(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let Snapshot {
+            mut counters,
+            mut distributions,
+            mut gauges,
+        } = self.get_recent_metrics();
+        let mut output = vec![];
+
+        for (name, mut by_labels) in counters.drain() {
+            for (labels, value) in by_labels.drain() {
+                let export = Export::new(&name, value, &labels, &None);
+                output.push(export.to_json()?);
+            }
+        }
+
+        for (name, mut by_labels) in gauges.drain() {
+            for (labels, value) in by_labels.drain() {
+                let export = Export::new(&name, value, &labels, &None);
+                output.push(export.to_json()?);
+            }
+        }
+
+        for (name, mut by_labels) in distributions.drain() {
+            for (labels, distribution) in by_labels.drain() {
+                let (sum, count) = match distribution {
+                    Distribution::Summary(summary, quantiles, sum) => {
+                        for quantile in quantiles.iter() {
+                            let value = summary.quantile(quantile.value()).unwrap_or(0.0);
+                            let additional = Some(format!("quantile={}", quantile.value()));
+                            let export = Export::new(&name, value, &labels, &additional);
+                            output.push(export.to_json()?);
+                        }
+
+                        (sum, summary.count() as u64)
+                    }
+                    Distribution::Histogram(histogram) => {
+                        for (le, count) in histogram.buckets() {
+                            let additional = Some(format!("le={}", le));
+                            let name = format!("{}_bucket", name);
+                            let export = Export::new(&name, count, &labels, &additional);
+                            output.push(export.to_json()?);
+                        }
+                        let name = format!("{}_bucket", name);
+                        let additional = Some("le=+Inf".into());
+                        let export = Export::new(&name, histogram.count(), &labels, &additional);
+                        output.push(export.to_json()?);
+                        (histogram.sum(), histogram.count())
+                    }
+                };
+
+                // write_metric_line::<&str, f64>(&mut output, &name, Some("sum"), &labels, None, sum);
+                let ex_name = format!("{}_sum", name);
+                let export = Export::new(&ex_name, sum, &labels, &None);
+                output.push(export.to_json()?);
+                let ex_name = format!("{}_count", name);
+                let export = Export::new(&ex_name, count, &labels, &None);
+                output.push(export.to_json()?);
+            }
+        }
+        Ok(output)
     }
 
     pub fn render(&self) -> String {
@@ -290,6 +377,11 @@ impl PrometheusHandle {
     /// Returns the metrics in Prometheus accepted String format.
     pub fn render(&self) -> String {
         self.inner.render()
+    }
+
+    /// Returns the metrics in newline delimited format.
+    pub fn render_nd_json(&self) -> Result<Vec<String>, Box<dyn Error>> {
+        self.inner.render_nd_json()
     }
 }
 
