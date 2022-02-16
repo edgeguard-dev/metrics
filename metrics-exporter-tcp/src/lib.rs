@@ -45,7 +45,7 @@
 //!
 //! [metrics]: https://docs.rs/metrics
 #![deny(missing_docs)]
-#![cfg_attr(docsrs, feature(doc_cfg), deny(broken_intra_doc_links))]
+#![cfg_attr(docsrs, feature(doc_cfg), deny(rustdoc::broken_intra_doc_links))]
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::sync::{
@@ -61,7 +61,10 @@ use std::{
 
 use bytes::Bytes;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use metrics::{GaugeValue, Key, Recorder, SetRecorderError, Unit};
+use metrics::{
+    Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Recorder,
+    SetRecorderError, Unit,
+};
 use mio::{
     net::{TcpListener, TcpStream},
     Events, Interest, Poll, Token, Waker,
@@ -80,15 +83,18 @@ mod proto {
 
 use self::proto::metadata::MetricType;
 
-enum MetricValue {
-    Counter(u64),
-    Gauge(GaugeValue),
-    Histogram(f64),
+enum MetricOperation {
+    IncrementCounter(u64),
+    SetCounter(u64),
+    IncrementGauge(f64),
+    DecrementGauge(f64),
+    SetGauge(f64),
+    RecordHistogram(f64),
 }
 
 enum Event {
-    Metadata(Key, MetricType, Option<Unit>, Option<&'static str>),
-    Metric(Key, MetricValue),
+    Metadata(KeyName, MetricType, Option<Unit>, &'static str),
+    Metric(Key, MetricOperation),
 }
 
 /// Errors that could occur while installing a TCP recorder/exporter.
@@ -113,20 +119,16 @@ impl From<SetRecorderError> for Error {
     }
 }
 
-#[derive(Clone)]
 struct State {
-    client_count: Arc<AtomicUsize>,
-    should_send: Arc<AtomicBool>,
-    waker: Arc<Waker>,
+    client_count: AtomicUsize,
+    should_send: AtomicBool,
+    waker: Waker,
+    tx: Sender<Event>,
 }
 
 impl State {
-    pub fn from_waker(waker: Waker) -> State {
-        State {
-            client_count: Arc::new(AtomicUsize::new(0)),
-            should_send: Arc::new(AtomicBool::new(false)),
-            waker: Arc::new(waker),
-        }
+    pub fn new(waker: Waker, tx: Sender<Event>) -> State {
+        State { client_count: AtomicUsize::new(0), should_send: AtomicBool::new(false), waker, tx }
     }
 
     pub fn should_send(&self) -> bool {
@@ -145,15 +147,73 @@ impl State {
         }
     }
 
+    fn register_metric(
+        &self,
+        key_name: KeyName,
+        metric_type: MetricType,
+        unit: Option<Unit>,
+        description: &'static str,
+    ) {
+        let _ = self.tx.try_send(Event::Metadata(key_name, metric_type, unit, description));
+        self.wake();
+    }
+
+    fn push_metric(&self, key: &Key, op: MetricOperation) {
+        if self.should_send() {
+            let _ = self.tx.try_send(Event::Metric(key.clone(), op));
+            self.wake();
+        }
+    }
+
     pub fn wake(&self) {
         let _ = self.waker.wake();
     }
 }
 
+struct Handle {
+    key: Key,
+    state: Arc<State>,
+}
+
+impl Handle {
+    fn new(key: Key, state: Arc<State>) -> Handle {
+        Handle { key, state }
+    }
+}
+
+impl CounterFn for Handle {
+    fn increment(&self, value: u64) {
+        self.state.push_metric(&self.key, MetricOperation::IncrementCounter(value))
+    }
+
+    fn absolute(&self, value: u64) {
+        self.state.push_metric(&self.key, MetricOperation::SetCounter(value))
+    }
+}
+
+impl GaugeFn for Handle {
+    fn increment(&self, value: f64) {
+        self.state.push_metric(&self.key, MetricOperation::IncrementGauge(value))
+    }
+
+    fn decrement(&self, value: f64) {
+        self.state.push_metric(&self.key, MetricOperation::DecrementGauge(value))
+    }
+
+    fn set(&self, value: f64) {
+        self.state.push_metric(&self.key, MetricOperation::SetGauge(value))
+    }
+}
+
+impl HistogramFn for Handle {
+    fn record(&self, value: f64) {
+        self.state.push_metric(&self.key, MetricOperation::RecordHistogram(value))
+    }
+}
+
 /// A TCP recorder.
 pub struct TcpRecorder {
-    tx: Sender<Event>,
-    state: State,
+    state: Arc<State>,
 }
 
 /// Builder for creating and installing a TCP recorder/exporter.
@@ -165,10 +225,7 @@ pub struct TcpBuilder {
 impl TcpBuilder {
     /// Creates a new `TcpBuilder`.
     pub fn new() -> TcpBuilder {
-        TcpBuilder {
-            listen_addr: ([0, 0, 0, 0], 5000).into(),
-            buffer_size: Some(1024),
-        }
+        TcpBuilder { listen_addr: ([0, 0, 0, 0], 5000).into(), buffer_size: Some(1024) }
     }
 
     /// Sets the listen address.
@@ -229,14 +286,10 @@ impl TcpBuilder {
         let waker = Waker::new(poll.registry(), WAKER)?;
 
         let mut listener = TcpListener::bind(self.listen_addr)?;
-        poll.registry()
-            .register(&mut listener, LISTENER, Interest::READABLE)?;
+        poll.registry().register(&mut listener, LISTENER, Interest::READABLE)?;
 
-        let state = State::from_waker(waker);
-        let recorder = TcpRecorder {
-            tx,
-            state: state.clone(),
-        };
+        let state = Arc::new(State::new(waker, tx));
+        let recorder = TcpRecorder { state: state.clone() };
 
         thread::spawn(move || run_transport(poll, listener, rx, state, buffer_size));
         Ok(recorder)
@@ -249,59 +302,38 @@ impl Default for TcpBuilder {
     }
 }
 
-impl TcpRecorder {
-    fn register_metric(
-        &self,
-        key: &Key,
-        metric_type: MetricType,
-        unit: Option<Unit>,
-        description: Option<&'static str>,
-    ) {
-        let _ = self
-            .tx
-            .try_send(Event::Metadata(key.clone(), metric_type, unit, description));
-        self.state.wake();
-    }
-
-    fn push_metric(&self, key: &Key, value: MetricValue) {
-        if self.state.should_send() {
-            let _ = self.tx.try_send(Event::Metric(key.clone(), value));
-            self.state.wake();
-        }
-    }
-}
-
 impl Recorder for TcpRecorder {
-    fn register_counter(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
-        self.register_metric(key, MetricType::Counter, unit, description);
+    fn describe_counter(&self, key_name: KeyName, unit: Option<Unit>, description: &'static str) {
+        self.state.register_metric(key_name, MetricType::Counter, unit, description);
     }
 
-    fn register_gauge(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
-        self.register_metric(key, MetricType::Gauge, unit, description);
+    fn describe_gauge(&self, key_name: KeyName, unit: Option<Unit>, description: &'static str) {
+        self.state.register_metric(key_name, MetricType::Gauge, unit, description);
     }
 
-    fn register_histogram(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
-        self.register_metric(key, MetricType::Histogram, unit, description);
+    fn describe_histogram(&self, key_name: KeyName, unit: Option<Unit>, description: &'static str) {
+        self.state.register_metric(key_name, MetricType::Histogram, unit, description);
     }
 
-    fn increment_counter(&self, key: &Key, value: u64) {
-        self.push_metric(key, MetricValue::Counter(value));
+    fn register_counter(&self, key: &Key) -> Counter {
+        Counter::from_arc(Arc::new(Handle::new(key.clone(), self.state.clone())))
     }
 
-    fn update_gauge(&self, key: &Key, value: GaugeValue) {
-        self.push_metric(key, MetricValue::Gauge(value));
+    fn register_gauge(&self, key: &Key) -> Gauge {
+        Gauge::from_arc(Arc::new(Handle::new(key.clone(), self.state.clone())))
     }
 
-    fn record_histogram(&self, key: &Key, value: f64) {
-        self.push_metric(key, MetricValue::Histogram(value));
+    fn register_histogram(&self, key: &Key) -> Histogram {
+        Histogram::from_arc(Arc::new(Handle::new(key.clone(), self.state.clone())))
     }
 }
 
+#[allow(clippy::mutable_key_type)]
 fn run_transport(
     mut poll: Poll,
     listener: TcpListener,
     rx: Receiver<Event>,
-    state: State,
+    state: Arc<State>,
     buffer_size: Option<usize>,
 ) {
     let buffer_limit = buffer_size.unwrap_or(std::usize::MAX);
@@ -359,7 +391,7 @@ fn run_transport(
                                     .or_insert_with(|| (metric_type, None, None));
                                 let (_, uentry, dentry) = entry;
                                 *uentry = unit;
-                                *dentry = desc;
+                                *dentry = Some(desc);
                             }
                             Event::Metric(key, value) => {
                                 match convert_metric_to_protobuf_encoded(key, value) {
@@ -396,11 +428,8 @@ fn run_transport(
                         // If there are more messages to hand off to a client than the client's
                         // internal list has room for, we remove as many as needed to do so.  This
                         // means we prioritize sending newer metrics if connections are backed up.
-                        let available = if msgs.len() < buffer_limit {
-                            buffer_limit - msgs.len()
-                        } else {
-                            0
-                        };
+                        let available =
+                            if msgs.len() < buffer_limit { buffer_limit - msgs.len() } else { 0 };
                         let to_drain = buffered_pmsgs.len().saturating_sub(available);
                         let _ = msgs.drain(0..to_drain);
                         msgs.extend(buffered_pmsgs.iter().take(buffer_limit).cloned());
@@ -470,12 +499,13 @@ fn run_transport(
     }
 }
 
+#[allow(clippy::mutable_key_type)]
 fn generate_metadata_messages(
-    metadata: &HashMap<Key, (MetricType, Option<Unit>, Option<&'static str>)>,
+    metadata: &HashMap<KeyName, (MetricType, Option<Unit>, Option<&'static str>)>,
 ) -> VecDeque<Bytes> {
     let mut bufs = VecDeque::new();
-    for (key, (metric_type, unit, desc)) in metadata.iter() {
-        let msg = convert_metadata_to_protobuf_encoded(key, *metric_type, unit.clone(), *desc)
+    for (key_name, (metric_type, unit, desc)) in metadata.iter() {
+        let msg = convert_metadata_to_protobuf_encoded(key_name, *metric_type, unit.clone(), *desc)
             .expect("failed to encode metadata buffer");
         bufs.push_back(msg);
     }
@@ -513,12 +543,7 @@ fn drive_connection(
                 // chunk of the buffer.  TODO: do we need to reregister ourselves to track writable
                 // status??
                 let remaining = buf.split_off(n);
-                trace!(
-                    ?conn,
-                    written = n,
-                    remaining = remaining.len(),
-                    "partial write"
-                );
+                trace!(?conn, written = n, remaining = remaining.len(), "partial write");
                 wbuf.replace(remaining);
                 return false;
             }
@@ -534,61 +559,46 @@ fn drive_connection(
 }
 
 fn convert_metadata_to_protobuf_encoded(
-    key: &Key,
+    key_name: &KeyName,
     metric_type: MetricType,
     unit: Option<Unit>,
     desc: Option<&'static str>,
 ) -> Result<Bytes, EncodeError> {
-    let name = key.name().to_string();
+    let name = key_name.as_str().to_string();
     let metadata = proto::Metadata {
         name,
         metric_type: metric_type.into(),
         unit: unit.map(|u| proto::metadata::Unit::UnitValue(u.as_str().to_owned())),
         description: desc.map(|d| proto::metadata::Description::DescriptionValue(d.to_owned())),
     };
-    let event = proto::Event {
-        event: Some(proto::event::Event::Metadata(metadata)),
-    };
+    let event = proto::Event { event: Some(proto::event::Event::Metadata(metadata)) };
 
     let mut buf = Vec::new();
     event.encode_length_delimited(&mut buf)?;
     Ok(Bytes::from(buf))
 }
 
-fn convert_metric_to_protobuf_encoded(key: Key, value: MetricValue) -> Result<Bytes, EncodeError> {
+fn convert_metric_to_protobuf_encoded(
+    key: Key,
+    operation: MetricOperation,
+) -> Result<Bytes, EncodeError> {
     let name = key.name().to_string();
     let labels = key
         .labels()
         .map(|label| (label.key().to_owned(), label.value().to_owned()))
         .collect::<BTreeMap<_, _>>();
-    let mvalue = match value {
-        MetricValue::Counter(cv) => proto::metric::Value::Counter(proto::Counter { value: cv }),
-        MetricValue::Gauge(gv) => match gv {
-            GaugeValue::Absolute(val) => proto::metric::Value::Gauge(proto::Gauge {
-                value: Some(proto::gauge::Value::Absolute(val)),
-            }),
-            GaugeValue::Increment(val) => proto::metric::Value::Gauge(proto::Gauge {
-                value: Some(proto::gauge::Value::Increment(val)),
-            }),
-            GaugeValue::Decrement(val) => proto::metric::Value::Gauge(proto::Gauge {
-                value: Some(proto::gauge::Value::Decrement(val)),
-            }),
-        },
-        MetricValue::Histogram(hv) => {
-            proto::metric::Value::Histogram(proto::Histogram { value: hv })
-        }
+    let operation = match operation {
+        MetricOperation::IncrementCounter(v) => proto::metric::Operation::IncrementCounter(v),
+        MetricOperation::SetCounter(v) => proto::metric::Operation::SetCounter(v),
+        MetricOperation::IncrementGauge(v) => proto::metric::Operation::IncrementGauge(v),
+        MetricOperation::DecrementGauge(v) => proto::metric::Operation::DecrementGauge(v),
+        MetricOperation::SetGauge(v) => proto::metric::Operation::SetGauge(v),
+        MetricOperation::RecordHistogram(v) => proto::metric::Operation::RecordHistogram(v),
     };
 
     let now: prost_types::Timestamp = SystemTime::now().into();
-    let metric = proto::Metric {
-        name,
-        labels,
-        timestamp: Some(now),
-        value: Some(mvalue),
-    };
-    let event = proto::Event {
-        event: Some(proto::event::Event::Metric(metric)),
-    };
+    let metric = proto::Metric { name, labels, timestamp: Some(now), operation: Some(operation) };
+    let event = proto::Event { event: Some(proto::event::Event::Metric(metric)) };
 
     let mut buf = Vec::new();
     event.encode_length_delimited(&mut buf)?;

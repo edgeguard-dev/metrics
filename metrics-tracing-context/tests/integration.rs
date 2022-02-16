@@ -78,10 +78,8 @@ where
     metrics::clear_recorder();
     metrics::set_boxed_recorder(Box::new(recorder)).expect("failed to install recorder");
 
-    let test_guard = TestGuard {
-        _test_mutex_guard: test_mutex_guard,
-        _tracing_guard: tracing_guard,
-    };
+    let test_guard =
+        TestGuard { _test_mutex_guard: test_mutex_guard, _tracing_guard: tracing_guard };
     (test_guard, snapshotter)
 }
 
@@ -96,7 +94,7 @@ fn test_basic_functionality() {
 
     counter!("login_attempts", 1, "service" => "login_service");
 
-    let snapshot = snapshotter.snapshot();
+    let snapshot = snapshotter.snapshot().into_vec();
 
     assert_eq!(
         snapshot,
@@ -132,7 +130,7 @@ fn test_macro_forms() {
     counter!("login_attempts_static_and_dynamic_labels", 1,
         "service" => "login_service", "node_name" => node_name.clone());
 
-    let snapshot = snapshotter.snapshot();
+    let snapshot = snapshotter.snapshot().into_vec();
 
     assert_eq!(
         snapshot,
@@ -186,12 +184,12 @@ fn test_no_labels() {
 
     counter!("login_attempts", 1);
 
-    let snapshot = snapshotter.snapshot();
+    let snapshot = snapshotter.snapshot().into_vec();
 
     assert_eq!(
         snapshot,
         vec![(
-            CompositeKey::new(MetricKind::Counter, Key::from_static_name(LOGIN_ATTEMPTS),),
+            CompositeKey::new(MetricKind::Counter, Key::from_static_name(LOGIN_ATTEMPTS)),
             None,
             None,
             DebugValue::Counter(1),
@@ -236,7 +234,7 @@ fn test_multiple_paths_to_the_same_callsite() {
     path1();
     path2();
 
-    let snapshot = snapshotter.snapshot();
+    let snapshot = snapshotter.snapshot().into_vec();
 
     assert_eq!(
         snapshot,
@@ -296,7 +294,7 @@ fn test_nested_spans() {
 
     outer();
 
-    let snapshot = snapshotter.snapshot();
+    let snapshot = snapshotter.snapshot().into_vec();
 
     assert_eq!(
         snapshot,
@@ -332,7 +330,7 @@ fn test_label_filtering() {
 
     counter!("login_attempts", 1, "user.email" => "ferris@rust-lang.org");
 
-    let snapshot = snapshotter.snapshot();
+    let snapshot = snapshotter.snapshot().into_vec();
 
     assert_eq!(
         snapshot,

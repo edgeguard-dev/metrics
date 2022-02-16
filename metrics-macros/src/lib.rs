@@ -6,14 +6,14 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote, ToTokens};
 use syn::parse::{Error, Parse, ParseStream, Result};
 use syn::{parse::discouraged::Speculative, Lit};
-use syn::{parse_macro_input, Expr, LitStr, Token};
+use syn::{parse_macro_input, Expr, Token};
 
 #[cfg(test)]
 mod tests;
 
 enum Labels {
     Existing(Expr),
-    Inline(Vec<(LitStr, Expr)>),
+    Inline(Vec<(Expr, Expr)>),
 }
 
 struct WithoutExpression {
@@ -27,11 +27,10 @@ struct WithExpression {
     labels: Option<Labels>,
 }
 
-struct Registration {
+struct Description {
     key: Expr,
     unit: Option<Expr>,
-    description: Option<LitStr>,
-    labels: Option<Labels>,
+    description: Expr,
 }
 
 impl Parse for WithoutExpression {
@@ -48,134 +47,104 @@ impl Parse for WithExpression {
         let key = input.parse::<Expr>()?;
 
         input.parse::<Token![,]>()?;
-        let op_value: Expr = input.parse()?;
+        let op_value = input.parse::<Expr>()?;
 
         let labels = parse_labels(&mut input)?;
 
-        Ok(WithExpression {
-            key,
-            op_value,
-            labels,
-        })
+        Ok(WithExpression { key, op_value, labels })
     }
 }
 
-impl Parse for Registration {
-    fn parse(mut input: ParseStream) -> Result<Self> {
+impl Parse for Description {
+    fn parse(input: ParseStream) -> Result<Self> {
         let key = input.parse::<Expr>()?;
 
-        // We accept three possible parameters: unit, description, and labels.
+        // We accept two possible parameters: unit, and description.
         //
-        // If our first parameter is a literal string, we either have the description and no labels,
-        // or a description and labels.  Peek at the trailing token after the description to see if
-        // we need to keep parsing.
+        // There is only one specific requirement that must be met, and that is that the unit _must_
+        // have a qualified path of either `metrics::Unit::...` or `Unit::..` for us to properly
+        // distinguish it amongst the macro parameters.
 
-        // This may or may not be the start of labels, if the description has been omitted, so
-        // we hold on to it until we can make sure nothing else is behind it, or if it's a full
-        // fledged set of labels.
-        let (unit, description, labels) = if input.peek(Token![,]) && input.peek3(Token![=>]) {
-            // We have a ", <something> =>" pattern, which can only be labels, so we have no
-            // unit or description.
-            let labels = parse_labels(&mut input)?;
+        // Now try to read out the components.  We speculatively try to parse out a unit if it
+        // exists, and otherwise we just look for the description.
+        let unit = input
+            .call(|s| {
+                let forked = s.fork();
+                forked.parse::<Token![,]>()?;
 
-            (None, None, labels)
-        } else if input.peek(Token![,]) && input.peek2(LitStr) {
-            // We already know we're not working with labels only, and if we have ", <literal
-            // string>" then we have to at least have a description, possibly with labels.
-            input.parse::<Token![,]>()?;
-            let description = input.parse::<LitStr>().ok();
-            let labels = parse_labels(&mut input)?;
-            (None, description, labels)
-        } else if input.peek(Token![,]) {
-            // We may or may not have anything left to parse here, but it could also be any
-            // combination of unit + description and/or labels.
-            //
-            // We speculatively try and parse an expression from the buffer, and see if we can match
-            // it to the qualified name of the Unit enum.  We run all of the other normal parsing
-            // after that for description and labels.
-            let forked = input.fork();
-            forked.parse::<Token![,]>()?;
-
-            let unit = if let Ok(Expr::Path(path)) = forked.parse::<Expr>() {
-                let qname = path
-                    .path
-                    .segments
-                    .iter()
-                    .map(|x| x.ident.to_string())
-                    .collect::<Vec<_>>()
-                    .join("::");
-                if qname.starts_with("metrics::Unit") || qname.starts_with("Unit") {
-                    Some(Expr::Path(path))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            // If we succeeded, advance the main parse stream up to where the fork left off.
-            if unit.is_some() {
-                input.advance_to(&forked);
-            }
-
-            // We still have to check for a possible description.
-            let description =
-                if input.peek(Token![,]) && input.peek2(LitStr) && !input.peek3(Token![=>]) {
-                    input.parse::<Token![,]>()?;
-                    input.parse::<LitStr>().ok()
+                let output = if let Ok(Expr::Path(path)) = forked.parse::<Expr>() {
+                    let qname = path
+                        .path
+                        .segments
+                        .iter()
+                        .map(|x| x.ident.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    if qname.starts_with("metrics::Unit") || qname.starts_with("Unit") {
+                        Some(Expr::Path(path))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
 
-            let labels = parse_labels(&mut input)?;
-            (unit, description, labels)
-        } else {
-            (None, None, None)
-        };
+                if output.is_some() {
+                    s.advance_to(&forked);
+                }
 
-        Ok(Registration {
-            key,
-            unit,
-            description,
-            labels,
-        })
+                Ok(output)
+            })
+            .ok()
+            .flatten();
+
+        input.parse::<Token![,]>()?;
+        let description = input.parse::<Expr>()?;
+
+        Ok(Description { key, unit, description })
     }
 }
 
 #[proc_macro]
-pub fn register_counter(input: TokenStream) -> TokenStream {
-    let Registration {
-        key,
-        unit,
-        description,
-        labels,
-    } = parse_macro_input!(input as Registration);
+pub fn describe_counter(input: TokenStream) -> TokenStream {
+    let Description { key, unit, description } = parse_macro_input!(input as Description);
 
-    get_expanded_registration("counter", key, unit, description, labels).into()
+    get_describe_code("counter", key, unit, description).into()
+}
+
+#[proc_macro]
+pub fn describe_gauge(input: TokenStream) -> TokenStream {
+    let Description { key, unit, description } = parse_macro_input!(input as Description);
+
+    get_describe_code("gauge", key, unit, description).into()
+}
+
+#[proc_macro]
+pub fn describe_histogram(input: TokenStream) -> TokenStream {
+    let Description { key, unit, description } = parse_macro_input!(input as Description);
+
+    get_describe_code("histogram", key, unit, description).into()
+}
+
+#[proc_macro]
+pub fn register_counter(input: TokenStream) -> TokenStream {
+    let WithoutExpression { key, labels } = parse_macro_input!(input as WithoutExpression);
+
+    get_register_and_op_code::<bool>("counter", key, labels, None).into()
 }
 
 #[proc_macro]
 pub fn register_gauge(input: TokenStream) -> TokenStream {
-    let Registration {
-        key,
-        unit,
-        description,
-        labels,
-    } = parse_macro_input!(input as Registration);
+    let WithoutExpression { key, labels } = parse_macro_input!(input as WithoutExpression);
 
-    get_expanded_registration("gauge", key, unit, description, labels).into()
+    get_register_and_op_code::<bool>("gauge", key, labels, None).into()
 }
 
 #[proc_macro]
 pub fn register_histogram(input: TokenStream) -> TokenStream {
-    let Registration {
-        key,
-        unit,
-        description,
-        labels,
-    } = parse_macro_input!(input as Registration);
+    let WithoutExpression { key, labels } = parse_macro_input!(input as WithoutExpression);
 
-    get_expanded_registration("histogram", key, unit, description, labels).into()
+    get_register_and_op_code::<bool>("histogram", key, labels, None).into()
 }
 
 #[proc_macro]
@@ -184,131 +153,117 @@ pub fn increment_counter(input: TokenStream) -> TokenStream {
 
     let op_value = quote! { 1 };
 
-    get_expanded_callsite("counter", "increment", key, labels, op_value).into()
+    get_register_and_op_code("counter", key, labels, Some(("increment", op_value))).into()
 }
 
 #[proc_macro]
 pub fn counter(input: TokenStream) -> TokenStream {
-    let WithExpression {
-        key,
-        op_value,
-        labels,
-    } = parse_macro_input!(input as WithExpression);
+    let WithExpression { key, op_value, labels } = parse_macro_input!(input as WithExpression);
 
-    get_expanded_callsite("counter", "increment", key, labels, op_value).into()
+    get_register_and_op_code("counter", key, labels, Some(("increment", op_value))).into()
+}
+
+#[proc_macro]
+pub fn absolute_counter(input: TokenStream) -> TokenStream {
+    let WithExpression { key, op_value, labels } = parse_macro_input!(input as WithExpression);
+
+    get_register_and_op_code("counter", key, labels, Some(("absolute", op_value))).into()
 }
 
 #[proc_macro]
 pub fn increment_gauge(input: TokenStream) -> TokenStream {
-    let WithExpression {
-        key,
-        op_value,
-        labels,
-    } = parse_macro_input!(input as WithExpression);
+    let WithExpression { key, op_value, labels } = parse_macro_input!(input as WithExpression);
 
-    let gauge_value = quote! { metrics::GaugeValue::Increment(#op_value) };
-
-    get_expanded_callsite("gauge", "update", key, labels, gauge_value).into()
+    get_register_and_op_code("gauge", key, labels, Some(("increment", op_value))).into()
 }
 
 #[proc_macro]
 pub fn decrement_gauge(input: TokenStream) -> TokenStream {
-    let WithExpression {
-        key,
-        op_value,
-        labels,
-    } = parse_macro_input!(input as WithExpression);
+    let WithExpression { key, op_value, labels } = parse_macro_input!(input as WithExpression);
 
-    let gauge_value = quote! { metrics::GaugeValue::Decrement(#op_value) };
-
-    get_expanded_callsite("gauge", "update", key, labels, gauge_value).into()
+    get_register_and_op_code("gauge", key, labels, Some(("decrement", op_value))).into()
 }
 
 #[proc_macro]
 pub fn gauge(input: TokenStream) -> TokenStream {
-    let WithExpression {
-        key,
-        op_value,
-        labels,
-    } = parse_macro_input!(input as WithExpression);
+    let WithExpression { key, op_value, labels } = parse_macro_input!(input as WithExpression);
 
-    let gauge_value = quote! { metrics::GaugeValue::Absolute(#op_value) };
-
-    get_expanded_callsite("gauge", "update", key, labels, gauge_value).into()
+    get_register_and_op_code("gauge", key, labels, Some(("set", op_value))).into()
 }
 
 #[proc_macro]
 pub fn histogram(input: TokenStream) -> TokenStream {
-    let WithExpression {
-        key,
-        op_value,
-        labels,
-    } = parse_macro_input!(input as WithExpression);
+    let WithExpression { key, op_value, labels } = parse_macro_input!(input as WithExpression);
 
-    get_expanded_callsite("histogram", "record", key, labels, op_value).into()
+    get_register_and_op_code("histogram", key, labels, Some(("record", op_value))).into()
 }
 
-fn get_expanded_registration(
+fn get_describe_code(
     metric_type: &str,
     name: Expr,
     unit: Option<Expr>,
-    description: Option<LitStr>,
-    labels: Option<Labels>,
+    description: Expr,
 ) -> TokenStream2 {
-    let register_ident = format_ident!("register_{}", metric_type);
+    let describe_ident = format_ident!("describe_{}", metric_type);
 
     let unit = match unit {
         Some(e) => quote! { Some(#e) },
         None => quote! { None },
     };
 
-    let description = match description {
-        Some(s) => quote! { Some(#s) },
-        None => quote! { None },
-    };
-
-    let statics = generate_statics(&name, &labels);
-    let (locals, metric_key) = generate_metric_key(&name, &labels);
     quote! {
         {
-            #statics
             // Only do this work if there's a recorder installed.
             if let Some(recorder) = metrics::try_recorder() {
-                #locals
-                recorder.#register_ident(#metric_key, #unit, #description);
+                recorder.#describe_ident(#name.into(), #unit, #description);
             }
         }
     }
 }
 
-fn get_expanded_callsite<V>(
+fn get_register_and_op_code<V>(
     metric_type: &str,
-    op_type: &str,
     name: Expr,
     labels: Option<Labels>,
-    op_values: V,
+    op: Option<(&'static str, V)>,
 ) -> TokenStream2
 where
     V: ToTokens,
 {
-    // We use a helper method for histogram values to coerce into f64, but otherwise,
-    // just pass through whatever the caller gave us.
-    let op_values = if metric_type == "histogram" {
-        quote! { metrics::__into_f64(#op_values) }
-    } else {
-        quote! { #op_values }
-    };
-
-    let op_ident = format_ident!("{}_{}", op_type, metric_type);
+    let register_ident = format_ident!("register_{}", metric_type);
     let statics = generate_statics(&name, &labels);
     let (locals, metric_key) = generate_metric_key(&name, &labels);
-    quote! {
-        {
-            #statics
-            // Only do this work if there's a recorder installed.
-            if let Some(recorder) = metrics::try_recorder() {
-                #locals
-                recorder.#op_ident(#metric_key, #op_values);
+    match op {
+        Some((op_type, op_value)) => {
+            let op_ident = format_ident!("{}", op_type);
+            let op_value = if metric_type == "histogram" {
+                quote! { metrics::__into_f64(#op_value) }
+            } else {
+                quote! { #op_value }
+            };
+
+            // We've been given values to actually use with the handle, so we actually check if a
+            // recorder is installed before bothering to create a handle and everything.
+            quote! {
+                {
+                    #statics
+                    // Only do this work if there's a recorder installed.
+                    if let Some(recorder) = metrics::try_recorder() {
+                        #locals
+                        let handle = recorder.#register_ident(#metric_key);
+                        handle.#op_ident(#op_value);
+                    }
+                }
+            }
+        }
+        None => {
+            // If there's no values specified, we simply return the metric handle.
+            quote! {
+                {
+                    #statics
+                    #locals
+                    metrics::recorder().#register_ident(#metric_key)
+                }
             }
         }
     }
@@ -325,7 +280,9 @@ fn name_is_fast_path(name: &Expr) -> bool {
 fn labels_are_fast_path(labels: &Labels) -> bool {
     match labels {
         Labels::Existing(_) => false,
-        Labels::Inline(pairs) => pairs.iter().all(|(_, v)| matches!(v, Expr::Lit(_))),
+        Labels::Inline(pairs) => {
+            pairs.iter().all(|(k, v)| matches!((k, v), (Expr::Lit(_), Expr::Lit(_))))
+        }
     }
 }
 
@@ -444,9 +401,7 @@ fn generate_metric_key(name: &Expr, labels: &Option<Labels>) -> (TokenStream2, T
 fn labels_to_quoted(labels: &Labels) -> proc_macro2::TokenStream {
     match labels {
         Labels::Inline(pairs) => {
-            let labels = pairs
-                .iter()
-                .map(|(key, val)| quote! { metrics::Label::new(#key, #val) });
+            let labels = pairs.iter().map(|(key, val)| quote! { metrics::Label::new(#key, #val) });
             quote! { vec![#(#labels),*] }
         }
         Labels::Existing(e) => quote! { #e },
@@ -473,7 +428,7 @@ fn parse_labels(input: &mut ParseStream) -> Result<Option<Labels>> {
     // pairs.  If we don't have that, we check to see if we have a "`, <expr" part, which could us
     // getting handed a labels iterator.  The type checking for `IntoLabels` in `metrics::Recorder`
     // will do the heavy lifting from that point forward.
-    if input.peek(Token![,]) && input.peek2(LitStr) && input.peek3(Token![=>]) {
+    if input.peek(Token![,]) && input.peek3(Token![=>]) {
         let mut labels = Vec::new();
         loop {
             if input.is_empty() {
@@ -484,11 +439,11 @@ fn parse_labels(input: &mut ParseStream) -> Result<Option<Labels>> {
                 break;
             }
 
-            let lkey: LitStr = input.parse()?;
+            let k = input.parse::<Expr>()?;
             input.parse::<Token![=>]>()?;
-            let lvalue: Expr = input.parse()?;
+            let v = input.parse::<Expr>()?;
 
-            labels.push((lkey, lvalue));
+            labels.push((k, v));
         }
 
         return Ok(Some(Labels::Inline(labels)));
@@ -502,11 +457,8 @@ fn parse_labels(input: &mut ParseStream) -> Result<Option<Labels>> {
         return Ok(None);
     }
 
-    let lvalue: Expr = input.parse().map_err(|e| {
-        Error::new(
-            e.span(),
-            "expected label expression, but expression not found",
-        )
+    let existing = input.parse::<Expr>().map_err(|e| {
+        Error::new(e.span(), "expected labels expression, but expression not found")
     })?;
 
     // Expression can end with a trailing comma, handle it.
@@ -514,5 +466,5 @@ fn parse_labels(input: &mut ParseStream) -> Result<Option<Labels>> {
         input.parse::<Token![,]>()?;
     }
 
-    Ok(Some(Labels::Existing(lvalue)))
+    Ok(Some(Labels::Existing(existing)))
 }
