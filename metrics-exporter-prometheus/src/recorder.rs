@@ -144,7 +144,7 @@ impl Inner {
         }
 
         for (name, mut by_labels) in distributions.drain() {
-            for (labels, distribution) in by_labels.drain() {
+            for (labels, distribution) in by_labels.drain(..) {
                 let (sum, count) = match distribution {
                     Distribution::Summary(summary, quantiles, sum) => {
                         for quantile in quantiles.iter() {
