@@ -1,6 +1,6 @@
 [package]
 name = "metrics"
-version = "0.17.0"
+version = "0.18.0"
 authors = ["Toby Lawrence <toby@nuclearfurnace.com>"]
 edition = "2018"
 
@@ -17,9 +17,6 @@ keywords = ["metrics", "facade"]
 
 build = "build.rs"
 
-[package.metadata.docs.rs]
-features = ["std"]
-
 [lib]
 bench = false
 
@@ -28,16 +25,11 @@ name = "macros"
 harness = false
 
 [dependencies]
-metrics-macros = { version = "^0.4", path = "../metrics-macros" }
-proc-macro-hack = "0.5"
-ahash = "0.7.4"
+metrics-macros = { version = "^0.5", path = "../metrics-macros" }
+ahash = { version = "0.7", default-features = false }
 
 [dev-dependencies]
 log = "0.4"
 criterion = { version = "0.3", default-features = false, features = ["html_reports", "cargo_bench_support"] }
 rand = "0.8"
 trybuild = "1"
-
-[features]
-default = ["std"]
-std = []

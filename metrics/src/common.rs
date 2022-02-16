@@ -59,7 +59,7 @@ impl GaugeValue {
 ///
 /// While metrics do not necessarily need to be tied to a particular unit to be recorded, some
 /// downstream systems natively support defining units and so they can be specified during registration.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Unit {
     /// Count.
     Count,
@@ -199,10 +199,7 @@ impl Unit {
 
     /// Whether or not this unit relates to the measurement of time.
     pub fn is_time_based(&self) -> bool {
-        matches!(
-            self,
-            Unit::Seconds | Unit::Milliseconds | Unit::Microseconds | Unit::Nanoseconds
-        )
+        matches!(self, Unit::Seconds | Unit::Milliseconds | Unit::Microseconds | Unit::Nanoseconds)
     }
 
     /// Whether or not this unit relates to the measurement of data.

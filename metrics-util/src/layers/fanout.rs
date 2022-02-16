@@ -1,4 +1,98 @@
-use metrics::{GaugeValue, Key, Recorder, Unit};
+use std::sync::Arc;
+
+use metrics::{
+    Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Recorder, Unit,
+};
+
+struct FanoutCounter {
+    counters: Vec<Counter>,
+}
+
+impl FanoutCounter {
+    pub fn from_counters(counters: Vec<Counter>) -> Self {
+        Self { counters }
+    }
+}
+
+impl CounterFn for FanoutCounter {
+    fn increment(&self, value: u64) {
+        for counter in &self.counters {
+            counter.increment(value);
+        }
+    }
+
+    fn absolute(&self, value: u64) {
+        for counter in &self.counters {
+            counter.absolute(value);
+        }
+    }
+}
+
+impl From<FanoutCounter> for Counter {
+    fn from(counter: FanoutCounter) -> Counter {
+        Counter::from_arc(Arc::new(counter))
+    }
+}
+
+struct FanoutGauge {
+    gauges: Vec<Gauge>,
+}
+
+impl FanoutGauge {
+    pub fn from_gauges(gauges: Vec<Gauge>) -> Self {
+        Self { gauges }
+    }
+}
+
+impl GaugeFn for FanoutGauge {
+    fn increment(&self, value: f64) {
+        for gauge in &self.gauges {
+            gauge.increment(value);
+        }
+    }
+
+    fn decrement(&self, value: f64) {
+        for gauge in &self.gauges {
+            gauge.decrement(value);
+        }
+    }
+
+    fn set(&self, value: f64) {
+        for gauge in &self.gauges {
+            gauge.set(value);
+        }
+    }
+}
+
+impl From<FanoutGauge> for Gauge {
+    fn from(gauge: FanoutGauge) -> Gauge {
+        Gauge::from_arc(Arc::new(gauge))
+    }
+}
+
+struct FanoutHistogram {
+    histograms: Vec<Histogram>,
+}
+
+impl FanoutHistogram {
+    pub fn from_histograms(histograms: Vec<Histogram>) -> Self {
+        Self { histograms }
+    }
+}
+
+impl HistogramFn for FanoutHistogram {
+    fn record(&self, value: f64) {
+        for histogram in &self.histograms {
+            histogram.record(value);
+        }
+    }
+}
+
+impl From<FanoutHistogram> for Histogram {
+    fn from(histogram: FanoutHistogram) -> Histogram {
+        Histogram::from_arc(Arc::new(histogram))
+    }
+}
 
 /// Fans out metrics to multiple recorders.
 pub struct Fanout {
@@ -6,40 +100,42 @@ pub struct Fanout {
 }
 
 impl Recorder for Fanout {
-    fn register_counter(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
+    fn describe_counter(&self, key_name: KeyName, unit: Option<Unit>, description: &'static str) {
         for recorder in &self.recorders {
-            recorder.register_counter(key, unit.clone(), description);
+            recorder.describe_counter(key_name.clone(), unit.clone(), description);
         }
     }
 
-    fn register_gauge(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
+    fn describe_gauge(&self, key_name: KeyName, unit: Option<Unit>, description: &'static str) {
         for recorder in &self.recorders {
-            recorder.register_gauge(key, unit.clone(), description);
+            recorder.describe_gauge(key_name.clone(), unit.clone(), description);
         }
     }
 
-    fn register_histogram(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
+    fn describe_histogram(&self, key_name: KeyName, unit: Option<Unit>, description: &'static str) {
         for recorder in &self.recorders {
-            recorder.register_histogram(key, unit.clone(), description);
+            recorder.describe_histogram(key_name.clone(), unit.clone(), description);
         }
     }
 
-    fn increment_counter(&self, key: &Key, value: u64) {
-        for recorder in &self.recorders {
-            recorder.increment_counter(key, value);
-        }
+    fn register_counter(&self, key: &Key) -> Counter {
+        let counters =
+            self.recorders.iter().map(|recorder| recorder.register_counter(key)).collect();
+
+        FanoutCounter::from_counters(counters).into()
     }
 
-    fn update_gauge(&self, key: &Key, value: GaugeValue) {
-        for recorder in &self.recorders {
-            recorder.update_gauge(key, value.clone());
-        }
+    fn register_gauge(&self, key: &Key) -> Gauge {
+        let gauges = self.recorders.iter().map(|recorder| recorder.register_gauge(key)).collect();
+
+        FanoutGauge::from_gauges(gauges).into()
     }
 
-    fn record_histogram(&self, key: &Key, value: f64) {
-        for recorder in &self.recorders {
-            recorder.record_histogram(key, value);
-        }
+    fn register_histogram(&self, key: &Key) -> Histogram {
+        let histograms =
+            self.recorders.iter().map(|recorder| recorder.register_histogram(key)).collect();
+
+        FanoutHistogram::from_histograms(histograms).into()
     }
 }
 
@@ -63,64 +159,42 @@ impl FanoutBuilder {
 
     /// Builds the `Fanout` layer.
     pub fn build(self) -> Fanout {
-        Fanout {
-            recorders: self.recorders,
-        }
+        Fanout { recorders: self.recorders }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::FanoutBuilder;
-    use crate::debugging::DebuggingRecorder;
-    use metrics::{GaugeValue, Recorder, Unit};
+    use crate::test_util::*;
+    use metrics::{Counter, Gauge, Histogram, Unit};
 
     #[test]
     fn test_basic_functionality() {
-        let recorder1 = DebuggingRecorder::new();
-        let snapshotter1 = recorder1.snapshotter();
-        let recorder2 = DebuggingRecorder::new();
-        let snapshotter2 = recorder2.snapshotter();
-        let fanout = FanoutBuilder::default()
-            .add_recorder(recorder1)
-            .add_recorder(recorder2)
-            .build();
+        let operations = vec![
+            RecorderOperation::DescribeCounter(
+                "counter_key".into(),
+                Some(Unit::Count),
+                "counter desc",
+            ),
+            RecorderOperation::DescribeGauge("gauge_key".into(), Some(Unit::Bytes), "gauge desc"),
+            RecorderOperation::DescribeHistogram(
+                "histogram_key".into(),
+                Some(Unit::Nanoseconds),
+                "histogram desc",
+            ),
+            RecorderOperation::RegisterCounter("counter_key".into(), Counter::noop()),
+            RecorderOperation::RegisterGauge("gauge_key".into(), Gauge::noop()),
+            RecorderOperation::RegisterHistogram("histogram_key".into(), Histogram::noop()),
+        ];
 
-        let tlkey = "tokio.loops".into();
-        let hsbkey = "hyper.sent.bytes".into();
+        let recorder1 = MockBasicRecorder::from_operations(operations.clone());
+        let recorder2 = MockBasicRecorder::from_operations(operations.clone());
+        let fanout =
+            FanoutBuilder::default().add_recorder(recorder1).add_recorder(recorder2).build();
 
-        let before1 = snapshotter1.snapshot();
-        let before2 = snapshotter2.snapshot();
-        assert_eq!(before1.len(), 0);
-        assert_eq!(before2.len(), 0);
-
-        let ud = &[(Unit::Count, "counter desc"), (Unit::Bytes, "gauge desc")];
-
-        fanout.register_counter(&tlkey, Some(ud[0].0.clone()), Some(ud[0].1));
-        fanout.register_gauge(&hsbkey, Some(ud[1].0.clone()), Some(ud[1].1));
-        fanout.increment_counter(&tlkey, 47);
-        fanout.update_gauge(&hsbkey, GaugeValue::Absolute(12.0));
-
-        let after1 = snapshotter1.snapshot();
-        let after2 = snapshotter2.snapshot();
-        assert_eq!(after1.len(), 2);
-        assert_eq!(after2.len(), 2);
-
-        let after = after1
-            .into_iter()
-            .zip(after2)
-            .enumerate()
-            .collect::<Vec<_>>();
-
-        for (i, ((k1, u1, d1, v1), (k2, u2, d2, v2))) in after {
-            assert_eq!(k1, k2);
-            assert_eq!(u1, u2);
-            assert_eq!(d1, d2);
-            assert_eq!(v1, v2);
-            assert_eq!(Some(ud[i].0.clone()), u1);
-            assert_eq!(Some(ud[i].0.clone()), u2);
-            assert_eq!(Some(ud[i].1), d1);
-            assert_eq!(Some(ud[i].1), d2);
+        for operation in operations {
+            operation.apply_to_recorder(&fanout);
         }
     }
 }

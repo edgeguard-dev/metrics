@@ -2,8 +2,8 @@ use std::thread;
 use std::time::Duration;
 
 use metrics::{
-    decrement_gauge, gauge, histogram, increment_counter, increment_gauge, register_counter,
-    register_histogram,
+    decrement_gauge, describe_counter, describe_histogram, gauge, histogram, increment_counter,
+    increment_gauge,
 };
 use metrics_exporter_prometheus::PrometheusBuilder;
 use metrics_util::MetricKindMask;
@@ -29,12 +29,9 @@ fn main() {
     //
     // Registering metrics ahead of using them is not required, but is the only way to specify the
     // description of a metric.
-    register_counter!(
-        "tcp_server_loops",
-        "The iterations of the TCP server event loop so far."
-    );
-    register_histogram!(
-        "tcp_server_loop_delta_ns",
+    describe_counter!("tcp_server_loops", "The iterations of the TCP server event loop so far.");
+    describe_histogram!(
+        "tcp_server_loop_delta_secs",
         "The time taken for iterations of the TCP server event loop."
     );
 
@@ -50,7 +47,7 @@ fn main() {
 
         if let Some(t) = last {
             let delta: Duration = clock.now() - t;
-            histogram!("tcp_server_loop_delta_ns", delta, "system" => "foo");
+            histogram!("tcp_server_loop_delta_secs", delta, "system" => "foo");
         }
 
         let increment_gauge = thread_rng().gen_bool(0.75);

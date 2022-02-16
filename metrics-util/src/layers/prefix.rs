@@ -1,5 +1,5 @@
 use crate::layers::Layer;
-use metrics::{GaugeValue, Key, Recorder, SharedString, Unit};
+use metrics::{Counter, Gauge, Histogram, Key, KeyName, Recorder, SharedString, Unit};
 
 /// Applies a prefix to every metric key.
 ///
@@ -18,37 +18,46 @@ impl<R> Prefix<R> {
 
         Key::from_parts(new_name, key.labels())
     }
+
+    fn prefix_key_name(&self, key_name: KeyName) -> KeyName {
+        let mut new_name = String::with_capacity(self.prefix.len() + 1 + key_name.as_str().len());
+        new_name.push_str(self.prefix.as_ref());
+        new_name.push('.');
+        new_name.push_str(key_name.as_str());
+
+        KeyName::from(new_name)
+    }
 }
 
 impl<R: Recorder> Recorder for Prefix<R> {
-    fn register_counter(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
-        let new_key = self.prefix_key(key);
-        self.inner.register_counter(&new_key, unit, description)
+    fn describe_counter(&self, key_name: KeyName, unit: Option<Unit>, description: &'static str) {
+        let new_key_name = self.prefix_key_name(key_name);
+        self.inner.describe_counter(new_key_name, unit, description)
     }
 
-    fn register_gauge(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
-        let new_key = self.prefix_key(key);
-        self.inner.register_gauge(&new_key, unit, description)
+    fn describe_gauge(&self, key_name: KeyName, unit: Option<Unit>, description: &'static str) {
+        let new_key_name = self.prefix_key_name(key_name);
+        self.inner.describe_gauge(new_key_name, unit, description)
     }
 
-    fn register_histogram(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
-        let new_key = self.prefix_key(key);
-        self.inner.register_histogram(&new_key, unit, description)
+    fn describe_histogram(&self, key_name: KeyName, unit: Option<Unit>, description: &'static str) {
+        let new_key_name = self.prefix_key_name(key_name);
+        self.inner.describe_histogram(new_key_name, unit, description)
     }
 
-    fn increment_counter(&self, key: &Key, value: u64) {
+    fn register_counter(&self, key: &Key) -> Counter {
         let new_key = self.prefix_key(key);
-        self.inner.increment_counter(&new_key, value);
+        self.inner.register_counter(&new_key)
     }
 
-    fn update_gauge(&self, key: &Key, value: GaugeValue) {
+    fn register_gauge(&self, key: &Key) -> Gauge {
         let new_key = self.prefix_key(key);
-        self.inner.update_gauge(&new_key, value);
+        self.inner.register_gauge(&new_key)
     }
 
-    fn record_histogram(&self, key: &Key, value: f64) {
+    fn register_histogram(&self, key: &Key) -> Histogram {
         let new_key = self.prefix_key(key);
-        self.inner.record_histogram(&new_key, value);
+        self.inner.register_histogram(&new_key)
     }
 }
 
@@ -68,51 +77,80 @@ impl<R> Layer<R> for PrefixLayer {
     type Output = Prefix<R>;
 
     fn layer(&self, inner: R) -> Self::Output {
-        Prefix {
-            prefix: self.0.into(),
-            inner,
-        }
+        Prefix { prefix: self.0.into(), inner }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::PrefixLayer;
-    use crate::debugging::DebuggingRecorder;
+    use super::{Prefix, PrefixLayer};
     use crate::layers::Layer;
-    use metrics::{Recorder, Unit};
+    use crate::test_util::*;
+    use metrics::{Counter, Gauge, Histogram, Key, KeyName, Unit};
 
     #[test]
     fn test_basic_functionality() {
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let prefix = PrefixLayer::new("testing");
-        let layered = prefix.layer(recorder);
-
-        let ckey = "counter_metric".into();
-        let gkey = "gauge_metric".into();
-        let hkey = "histogram_metric".into();
-
-        let before = snapshotter.snapshot();
-        assert_eq!(before.len(), 0);
-
-        let ud = &[
-            (Unit::Nanoseconds, "counter desc"),
-            (Unit::Microseconds, "gauge desc"),
-            (Unit::Milliseconds, "histogram desc"),
+        let inputs = vec![
+            RecorderOperation::DescribeCounter(
+                "counter_key".into(),
+                Some(Unit::Count),
+                "counter desc",
+            ),
+            RecorderOperation::DescribeGauge("gauge_key".into(), Some(Unit::Bytes), "gauge desc"),
+            RecorderOperation::DescribeHistogram(
+                "histogram_key".into(),
+                Some(Unit::Nanoseconds),
+                "histogram desc",
+            ),
+            RecorderOperation::RegisterCounter("counter_key".into(), Counter::noop()),
+            RecorderOperation::RegisterGauge("gauge_key".into(), Gauge::noop()),
+            RecorderOperation::RegisterHistogram("histogram_key".into(), Histogram::noop()),
         ];
 
-        layered.register_counter(&ckey, Some(ud[0].0.clone()), Some(ud[0].1));
-        layered.register_gauge(&gkey, Some(ud[1].0.clone()), Some(ud[1].1));
-        layered.register_histogram(&hkey, Some(ud[2].0.clone()), Some(ud[2].1));
+        let expectations = vec![
+            RecorderOperation::DescribeCounter(
+                "testing.counter_key".into(),
+                Some(Unit::Count),
+                "counter desc",
+            ),
+            RecorderOperation::DescribeGauge(
+                "testing.gauge_key".into(),
+                Some(Unit::Bytes),
+                "gauge desc",
+            ),
+            RecorderOperation::DescribeHistogram(
+                "testing.histogram_key".into(),
+                Some(Unit::Nanoseconds),
+                "histogram desc",
+            ),
+            RecorderOperation::RegisterCounter("testing.counter_key".into(), Counter::noop()),
+            RecorderOperation::RegisterGauge("testing.gauge_key".into(), Gauge::noop()),
+            RecorderOperation::RegisterHistogram("testing.histogram_key".into(), Histogram::noop()),
+        ];
 
-        let after = snapshotter.snapshot();
-        assert_eq!(after.len(), 3);
+        let recorder = MockBasicRecorder::from_operations(expectations);
+        let prefix = PrefixLayer::new("testing");
+        let prefix = prefix.layer(recorder);
 
-        for (i, (key, unit, desc, _value)) in after.iter().enumerate() {
-            assert!(key.key().name().to_string().starts_with("testing"));
-            assert_eq!(&Some(ud[i].0.clone()), unit);
-            assert_eq!(&Some(ud[i].1), desc);
+        for operation in inputs {
+            operation.apply_to_recorder(&prefix);
         }
+    }
+
+    #[test]
+    fn test_key_vs_key_name() {
+        let prefix = Prefix { prefix: "foobar".into(), inner: () };
+
+        let key_name = KeyName::from("my_key");
+        let key = Key::from_name(key_name.clone());
+
+        let prefixed_key = prefix.prefix_key(&key);
+        let prefixed_key_name = prefix.prefix_key_name(key_name);
+
+        assert_eq!(
+            prefixed_key.name(),
+            prefixed_key_name.as_str(),
+            "prefixed key and prefixed key name should match"
+        );
     }
 }

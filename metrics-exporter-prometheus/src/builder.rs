@@ -1,52 +1,93 @@
 use std::collections::HashMap;
-#[cfg(feature = "tokio-exporter")]
+#[cfg(feature = "push-gateway")]
+use std::convert::TryFrom;
+#[cfg(any(feature = "http-listener", feature = "push-gateway"))]
 use std::future::Future;
+#[cfg(feature = "http-listener")]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-#[cfg(feature = "tokio-exporter")]
+#[cfg(any(feature = "http-listener", feature = "push-gateway"))]
+use std::pin::Pin;
+#[cfg(any(feature = "http-listener", feature = "push-gateway"))]
 use std::thread;
 use std::time::Duration;
 
-#[cfg(feature = "tokio-exporter")]
+#[cfg(any(feature = "http-listener", feature = "push-gateway"))]
+use hyper::Body;
+
+#[cfg(feature = "http-listener")]
 use hyper::{
     server::{conn::AddrStream, Server},
     service::{make_service_fn, service_fn},
-    StatusCode, {Body, Error as HyperError, Response},
+    Response, StatusCode,
 };
-use metrics::Key;
+
+#[cfg(feature = "push-gateway")]
+use hyper::{
+    body::{aggregate, Buf},
+    client::Client,
+    Method, Request, Uri,
+};
+
+use indexmap::IndexMap;
+#[cfg(feature = "http-listener")]
+use ipnet::IpNet;
 use parking_lot::RwLock;
 use quanta::Clock;
-#[cfg(feature = "tokio-exporter")]
-use tokio::{pin, runtime, select};
+#[cfg(any(feature = "http-listener", feature = "push-gateway"))]
+use tokio::runtime;
+#[cfg(feature = "push-gateway")]
+use tracing::error;
 
-use metrics_util::{parse_quantiles, Handle, MetricKindMask, Quantile, Recency, Registry, Tracked};
+use metrics_util::{parse_quantiles, recency::Recency, MetricKindMask, Quantile, Registry};
 
-#[cfg(feature = "tokio-exporter")]
-use crate::common::InstallError;
 use crate::common::Matcher;
 use crate::distribution::DistributionBuilder;
 use crate::recorder::{Inner, PrometheusRecorder};
-use std::pin::Pin;
+use crate::{common::BuildError, PrometheusHandle};
 
-#[cfg(feature = "push-gateway")]
+#[cfg(any(feature = "http-listener", feature = "push-gateway"))]
+type ExporterFuture = Pin<Box<dyn Future<Output = Result<(), hyper::Error>> + Send + 'static>>;
+
 #[derive(Clone)]
-pub struct PrometheusPushGatewayConfig {
-    address: String,
-    push_interval: std::time::Duration,
+enum ExporterConfig {
+    // Run an HTTP listener on the given `listen_address`.
+    #[cfg(feature = "http-listener")]
+    HttpListener { listen_address: SocketAddr },
+
+    // Run a push gateway task sending to the given `endpoint` after `interval` time has elapsed,
+    // infinitely.
+    #[cfg(feature = "push-gateway")]
+    PushGateway { endpoint: Uri, interval: Duration },
+
+    #[allow(dead_code)]
+    Unconfigured,
+}
+
+impl ExporterConfig {
+    #[cfg_attr(not(any(feature = "http-listener", feature = "push-gateway")), allow(dead_code))]
+    fn as_type_str(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "http-listener")]
+            Self::HttpListener { .. } => "http-listener",
+            #[cfg(feature = "push-gateway")]
+            Self::PushGateway { .. } => "push-gateway",
+            Self::Unconfigured => "unconfigured,",
+        }
+    }
 }
 
 /// Builder for creating and installing a Prometheus recorder/exporter.
 pub struct PrometheusBuilder {
-    listen_address: Option<SocketAddr>,
-    #[cfg(feature = "push-gateway")]
-    push_gateway_config: Option<PrometheusPushGatewayConfig>,
-    #[cfg(feature = "tokio-exporter")]
-    allow_ips: Option<Vec<ipnet::IpNet>>,
+    #[cfg_attr(not(any(feature = "http-listener", feature = "push-gateway")), allow(dead_code))]
+    exporter_config: ExporterConfig,
+    #[cfg(feature = "http-listener")]
+    allowed_addresses: Option<Vec<IpNet>>,
     quantiles: Vec<Quantile>,
     buckets: Option<Vec<f64>>,
     bucket_overrides: Option<HashMap<Matcher, Vec<f64>>>,
     idle_timeout: Option<Duration>,
     recency_mask: MetricKindMask,
-    global_labels: Option<HashMap<String, String>>,
+    global_labels: Option<IndexMap<String, String>>,
 }
 
 impl PrometheusBuilder {
@@ -54,62 +95,106 @@ impl PrometheusBuilder {
     pub fn new() -> Self {
         let quantiles = parse_quantiles(&[0.0, 0.5, 0.9, 0.95, 0.99, 0.999, 1.0]);
 
+        #[cfg(feature = "http-listener")]
+        let exporter_config = ExporterConfig::HttpListener {
+            listen_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 9000),
+        };
+        #[cfg(not(feature = "http-listener"))]
+        let exporter_config = ExporterConfig::Unconfigured;
+
         Self {
-            listen_address: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 9000)),
-            #[cfg(feature = "tokio-exporter")]
-            allow_ips: None,
+            exporter_config,
+            #[cfg(feature = "http-listener")]
+            allowed_addresses: None,
             quantiles,
             buckets: None,
             bucket_overrides: None,
             idle_timeout: None,
             recency_mask: MetricKindMask::NONE,
             global_labels: None,
-            #[cfg(feature = "push-gateway")]
-            push_gateway_config: None,
         }
     }
 
-    /// Sets the listen address for the Prometheus scrape endpoint.
+    /// Configures the exporter to expose an HTTP listener that functions as a [scrape endpoint].
     ///
     /// The HTTP listener that is spawned will respond to GET requests on any request path.
     ///
-    /// Defaults to `0.0.0.0:9000`.
-    pub fn listen_address(mut self, addr: impl Into<SocketAddr>) -> Self {
-        self.listen_address = Some(addr.into());
+    /// Running in HTTP listener mode is mutually exclusive with the push gateway i.e. enabling the
+    /// HTTP listener will disable the push gateway, and vise versa.
+    ///
+    /// Defaults to enabled, listening at `0.0.0.0:9000`.
+    ///
+    /// [scrape endpoint]: https://prometheus.io/docs/instrumenting/exposition_formats/#text-based-format
+    #[cfg(feature = "http-listener")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http-listener")))]
+    pub fn with_http_listener(mut self, addr: impl Into<SocketAddr>) -> Self {
+        self.exporter_config = ExporterConfig::HttpListener { listen_address: addr.into() };
         self
     }
 
-    /// Disable the HTTP listener. This is useful when you only want to use the
-    /// Prometheus push gateway.
-    pub fn disable_http_listener(mut self) -> Self {
-        self.listen_address = None;
-        self
-    }
-
-    /// Sets the push gateway address and push interval for the Prometheus push gateway.
+    /// Configures the exporter to push periodic requests to a Prometheus [push gateway].
+    ///
+    /// Running in push gateway mode is mutually exclusive with the HTTP listener i.e. enabling the
+    /// push gateway will disable the HTTP listener, and vise versa.
+    ///
+    /// Defaults to disabled.
+    ///
+    /// ## Errors
+    ///
+    /// If the given endpoint cannot be parsed into a valid URI, an error variant will be
+    /// returned describing the error.
+    ///
+    /// [push gateway]: https://prometheus.io/docs/instrumenting/pushing/
     #[cfg(feature = "push-gateway")]
-    pub fn push_gateway_config<T>(mut self, addr: T, interval: std::time::Duration) -> Self
+    #[cfg_attr(docsrs, doc(cfg(feature = "push-gateway")))]
+    pub fn with_push_gateway<T>(
+        mut self,
+        endpoint: T,
+        interval: Duration,
+    ) -> Result<Self, BuildError>
     where
         T: AsRef<str>,
     {
-        self.push_gateway_config = Some(PrometheusPushGatewayConfig {
-            address: addr.as_ref().to_string(),
-            push_interval: interval,
-        });
-        self
+        self.exporter_config = ExporterConfig::PushGateway {
+            endpoint: Uri::try_from(endpoint.as_ref())
+                .map_err(|e| BuildError::InvalidPushGatewayEndpoint(e.to_string()))?,
+            interval,
+        };
+
+        Ok(self)
     }
 
-    /// Adds an IP address or subnet that is allowed to connect to the Prometheus scrape endpoint.
+    /// Adds an IP address or subnet to the allowlist for the scrape endpoint.
     ///
-    /// By default (if this method is never called), no restrictions are enforced.
+    /// If a client makes a request to the scrape endpoint and their IP is not present in the
+    /// allowlist, either directly or within any of the allowed subnets, they will receive a 403
+    /// Forbidden response.
     ///
-    /// Note that this on its own is insufficient for access control, if the exporter is running in
-    /// an environment alongside applications (such as web browsers) that are susceptible to
-    /// [DNS rebinding attacks](https://en.wikipedia.org/wiki/DNS_rebinding).
-    #[cfg(feature = "tokio-exporter")]
-    pub fn add_allowed(mut self, subnet: ipnet::IpNet) -> Self {
-        self.allow_ips.get_or_insert(vec![]).push(subnet);
-        self
+    /// Defaults to allowing all IPs.
+    ///
+    /// ## Security Considerations
+    ///
+    /// On its own, an IP allowlist is insufficient for access control, if the exporter is running
+    /// in an environment alongside applications (such as web browsers) that are susceptible to [DNS
+    /// rebinding](https://en.wikipedia.org/wiki/DNS_rebinding) attacks.
+    ///
+    /// ## Errors
+    ///
+    /// If the given address cannot be parsed into an IP address or subnet, an error variant will be
+    /// returned describing the error.
+    #[cfg(feature = "http-listener")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http-listener")))]
+    pub fn add_allowed_address<A>(mut self, address: A) -> Result<Self, BuildError>
+    where
+        A: AsRef<str>,
+    {
+        use std::str::FromStr;
+
+        let address = IpNet::from_str(address.as_ref())
+            .map_err(|e| BuildError::InvalidAllowlistAddress(e.to_string()))?;
+        self.allowed_addresses.get_or_insert(vec![]).push(address);
+
+        Ok(self)
     }
 
     /// Sets the quantiles to use when rendering histograms.
@@ -117,24 +202,40 @@ impl PrometheusBuilder {
     /// Quantiles represent a scale of 0 to 1, where percentiles represent a scale of 1 to 100, so
     /// a quantile of 0.99 is the 99th percentile, and a quantile of 0.99 is the 99.9th percentile.
     ///
-    /// By default, the quantiles will be set to: 0.0, 0.5, 0.9, 0.95, 0.99, 0.999, and 1.0. This means
+    /// Defaults to a hard-coded set of quantiles: 0.0, 0.5, 0.9, 0.95, 0.99, 0.999, and 1.0. This means
     /// that all histograms will be exposed as Prometheus summaries.
     ///
     /// If buckets are set (via [`set_buckets`][Self::set_buckets] or
     /// [`set_buckets_for_metric`][Self::set_buckets_for_metric]) then all histograms will be exposed
     /// as summaries instead.
-    pub fn set_quantiles(mut self, quantiles: &[f64]) -> Self {
+    ///
+    /// ## Errors
+    ///
+    /// If `quantiles` is empty, an error variant will be thrown.
+    pub fn set_quantiles(mut self, quantiles: &[f64]) -> Result<Self, BuildError> {
+        if quantiles.is_empty() {
+            return Err(BuildError::EmptyBucketsOrQuantiles);
+        }
+
         self.quantiles = parse_quantiles(quantiles);
-        self
+        Ok(self)
     }
 
     /// Sets the buckets to use when rendering histograms.
     ///
     /// Buckets values represent the higher bound of each buckets.  If buckets are set, then all
     /// histograms will be rendered as true Prometheus histograms, instead of summaries.
-    pub fn set_buckets(mut self, values: &[f64]) -> Self {
+    ///
+    /// ## Errors
+    ///
+    /// If `values` is empty, an error variant will be thrown.
+    pub fn set_buckets(mut self, values: &[f64]) -> Result<Self, BuildError> {
+        if values.is_empty() {
+            return Err(BuildError::EmptyBucketsOrQuantiles);
+        }
+
         self.buckets = Some(values.to_vec());
-        self
+        Ok(self)
     }
 
     /// Sets the bucket for a specific pattern.
@@ -148,11 +249,23 @@ impl PrometheusBuilder {
     /// histograms that match will be rendered as true Prometheus histograms, instead of summaries.
     ///
     /// This option changes the observer's output of histogram-type metric into summaries.
-    /// It only affects matching metrics if set_buckets was not used.
-    pub fn set_buckets_for_metric(mut self, matcher: Matcher, values: &[f64]) -> Self {
+    /// It only affects matching metrics if [`set_buckets`][Self::set_buckets] was not used.
+    ///
+    /// ## Errors
+    ///
+    /// If `values` is empty, an error variant will be thrown.
+    pub fn set_buckets_for_metric(
+        mut self,
+        matcher: Matcher,
+        values: &[f64],
+    ) -> Result<Self, BuildError> {
+        if values.is_empty() {
+            return Err(BuildError::EmptyBucketsOrQuantiles);
+        }
+
         let buckets = self.bucket_overrides.get_or_insert_with(HashMap::new);
         buckets.insert(matcher.sanitized(), values.to_vec());
-        self
+        Ok(self)
     }
 
     /// Sets the idle timeout for metrics.
@@ -171,11 +284,7 @@ impl PrometheusBuilder {
     /// information on defining a metric kind mask.
     pub fn idle_timeout(mut self, mask: MetricKindMask, timeout: Option<Duration>) -> Self {
         self.idle_timeout = timeout;
-        self.recency_mask = if self.idle_timeout.is_none() {
-            MetricKindMask::NONE
-        } else {
-            mask
-        };
+        self.recency_mask = if self.idle_timeout.is_none() { MetricKindMask::NONE } else { mask };
         self
     }
 
@@ -189,51 +298,210 @@ impl PrometheusBuilder {
         K: Into<String>,
         V: Into<String>,
     {
-        let labels = self.global_labels.get_or_insert_with(HashMap::new);
+        let labels = self.global_labels.get_or_insert_with(IndexMap::new);
         labels.insert(key.into(), value.into());
         self
     }
 
     /// Builds the recorder and exporter and installs them globally.
     ///
-    /// An error will be returned if there's an issue with creating the HTTP server or with
-    /// installing the recorder as the global recorder.
-    #[cfg(feature = "tokio-exporter")]
-    pub fn install(self) -> Result<(), InstallError> {
-        let runtime = runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
+    /// When called from within a Tokio runtime, the exporter future is spawned directly
+    /// into the runtime.  Otherwise, a new single-threaded Tokio runtime is created
+    /// on a background thread, and the exporter is spawned there.
+    ///
+    /// ## Errors
+    ///
+    /// If there is an error while either building the recorder and exporter, or installing the
+    /// recorder and exporter, an error variant will be returned describing the error.
+    #[cfg(any(feature = "http-listener", feature = "push-gateway"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "http-listener", feature = "push-gateway"))))]
+    pub fn install(self) -> Result<(), BuildError> {
+        let recorder = if let Ok(handle) = runtime::Handle::try_current() {
+            let (recorder, exporter) = {
+                let _g = handle.enter();
+                self.build()?
+            };
 
-        let (recorder, exporter) = {
-            let _g = runtime.enter();
-            self.build_with_exporter()?
+            handle.spawn(exporter);
+
+            recorder
+        } else {
+            let thread_name =
+                format!("metrics-exporter-prometheus-{}", self.exporter_config.as_type_str());
+
+            let runtime = runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| BuildError::FailedToCreateRuntime(e.to_string()))?;
+
+            let (recorder, exporter) = {
+                let _g = runtime.enter();
+                self.build()?
+            };
+
+            thread::Builder::new()
+                .name(thread_name)
+                .spawn(move || runtime.block_on(exporter))
+                .map_err(|e| BuildError::FailedToCreateRuntime(e.to_string()))?;
+
+            recorder
         };
-        metrics::set_boxed_recorder(Box::new(recorder))?;
 
-        thread::Builder::new()
-            .name("metrics-exporter-prometheus-http".to_string())
-            .spawn(move || {
-                runtime.block_on(async move {
-                    pin!(exporter);
-                    loop {
-                        select! {
-                            _ = &mut exporter => {}
-                        }
-                    }
-                });
-            })?;
+        metrics::set_boxed_recorder(Box::new(recorder))?;
 
         Ok(())
     }
 
+    /// Builds the recorder and installs it globally, returning a handle to it.
+    ///
+    /// The handle can be used to generate valid Prometheus scrape endpoint payloads directly.
+    ///
+    /// ## Errors
+    ///
+    /// If there is an error while building the recorder, or installing the recorder, an error
+    /// variant will be returned describing the error.
+    pub fn install_recorder(self) -> Result<PrometheusHandle, BuildError> {
+        let recorder = self.build_recorder();
+        let handle = recorder.handle();
+
+        metrics::set_boxed_recorder(Box::new(recorder))?;
+
+        Ok(handle)
+    }
+
+    /// Builds the recorder and exporter and returns them both.
+    ///
+    /// In most cases, users should prefer to use [`install`][PrometheusBuilder::install] to create
+    /// and install the recorder and exporter automatically for them.  If a caller is combining
+    /// recorders, or needs to schedule the exporter to run in a particular way, this method, or
+    /// [`build_recorder`][PrometheusBuilder::build_recorder], provide the flexibility to do so.
+    ///
+    /// ## Panics
+    ///
+    /// This method must be called from within an existing Tokio runtime or it will panic.
+    ///
+    /// ## Errors
+    ///
+    /// If there is an error while building the recorder and exporter, an error variant will be
+    /// returned describing the error.
+    #[cfg(any(feature = "http-listener", feature = "push-gateway"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "http-listener", feature = "push-gateway"))))]
+    #[cfg_attr(not(feature = "http-listener"), allow(unused_mut))]
+    pub fn build(mut self) -> Result<(PrometheusRecorder, ExporterFuture), BuildError> {
+        #[cfg(feature = "http-listener")]
+        let allowed_addresses = self.allowed_addresses.take();
+
+        let exporter_config = self.exporter_config.clone();
+        let recorder = self.build_recorder();
+        let handle = recorder.handle();
+
+        match exporter_config {
+            ExporterConfig::Unconfigured => Err(BuildError::MissingExporterConfiguration),
+            #[cfg(feature = "http-listener")]
+            ExporterConfig::HttpListener { listen_address } => {
+                let server = Server::try_bind(&listen_address)
+                    .map_err(|e| BuildError::FailedToCreateHTTPListener(e.to_string()))?;
+                let exporter = async move {
+                    let make_svc = make_service_fn(move |socket: &AddrStream| {
+                        let remote_addr = socket.remote_addr().ip();
+
+                        // If the allowlist is empty, the request is allowed.  Otherwise, it must
+                        // match one of the entries in the allowlist or it will be denied.
+                        let is_allowed = allowed_addresses.as_ref().map_or(true, |addresses| {
+                            addresses.iter().any(|address| address.contains(&remote_addr))
+                        });
+
+                        let handle = handle.clone();
+
+                        async move {
+                            Ok::<_, hyper::Error>(service_fn(move |_| {
+                                let handle = handle.clone();
+
+                                async move {
+                                    if is_allowed {
+                                        let output = handle.render();
+                                        Ok::<_, hyper::Error>(Response::new(Body::from(output)))
+                                    } else {
+                                        Ok::<_, hyper::Error>(
+                                            Response::builder()
+                                                .status(StatusCode::FORBIDDEN)
+                                                .body(Body::empty())
+                                                .expect("static response is valid"),
+                                        )
+                                    }
+                                }
+                            }))
+                        }
+                    });
+                    server.serve(make_svc).await
+                };
+
+                Ok((recorder, Box::pin(exporter)))
+            }
+
+            #[cfg(feature = "push-gateway")]
+            ExporterConfig::PushGateway { endpoint, interval } => {
+                let exporter = async move {
+                    let client = Client::new();
+
+                    loop {
+                        // Sleep for `interval` amount of time, and then do a push.
+                        tokio::time::sleep(interval).await;
+
+                        let output = handle.render();
+                        let result = Request::builder()
+                            .method(Method::PUT)
+                            .uri(endpoint.clone())
+                            .body(Body::from(output));
+                        let req = match result {
+                            Ok(req) => req,
+                            Err(e) => {
+                                error!("failed to build push gateway request: {}", e);
+                                continue;
+                            }
+                        };
+
+                        match client.request(req).await {
+                            Ok(response) => {
+                                if !response.status().is_success() {
+                                    let status = response.status();
+                                    let status = status
+                                        .canonical_reason()
+                                        .unwrap_or_else(|| status.as_str());
+                                    let body = aggregate(response.into_body()).await;
+                                    let body = body
+                                        .map_err(|_| ())
+                                        .map(|mut b| b.copy_to_bytes(b.remaining()))
+                                        .map(|b| (&b[..]).to_vec())
+                                        .and_then(|s| String::from_utf8(s).map_err(|_| ()))
+                                        .unwrap_or_else(|_| {
+                                            String::from("<failed to read response body>")
+                                        });
+                                    error!(
+                                        message = "unexpected status after pushing metrics to push gateway",
+                                        status,
+                                        %body,
+                                    );
+                                }
+                            }
+                            Err(e) => error!("error sending request to push gateway: {:?}", e),
+                        }
+                    }
+                };
+
+                Ok((recorder, Box::pin(exporter)))
+            }
+        }
+    }
+
     /// Builds the recorder and returns it.
-    pub fn build(self) -> PrometheusRecorder {
+    pub fn build_recorder(self) -> PrometheusRecorder {
         self.build_with_clock(Clock::new())
     }
 
     pub(crate) fn build_with_clock(self, clock: Clock) -> PrometheusRecorder {
         let inner = Inner {
-            registry: Registry::<Key, Handle, Tracked<Handle>>::tracked(),
+            registry: Registry::new(),
             recency: Recency::new(clock, self.recency_mask, self.idle_timeout),
             distributions: RwLock::new(HashMap::new()),
             distribution_builder: DistributionBuilder::new(
@@ -242,102 +510,10 @@ impl PrometheusBuilder {
                 self.bucket_overrides,
             ),
             descriptions: RwLock::new(HashMap::new()),
-            global_labels: self.global_labels.unwrap_or(HashMap::new()),
+            global_labels: self.global_labels.unwrap_or_default(),
         };
 
         PrometheusRecorder::from(inner)
-    }
-
-    /// Builds the recorder and exporter and returns them both.
-    ///
-    /// In most cases, users should prefer to use [`PrometheusBuilder::install`] to create and
-    /// install the recorder and exporter automatically for them.  If a caller is combining
-    /// recorders, or needs to schedule the exporter to run in a particular way, this method
-    /// provides the flexibility to do so.
-    #[cfg(feature = "tokio-exporter")]
-    pub fn build_with_exporter(
-        mut self,
-    ) -> Result<
-        (
-            PrometheusRecorder,
-            Pin<Box<dyn Future<Output = Result<(), HyperError>> + Send + 'static>>,
-        ),
-        InstallError,
-    > {
-        let address = self.listen_address;
-        let allow_ips = self.allow_ips.take();
-        #[cfg(feature = "push-gateway")]
-        let push_gateway_config = self.push_gateway_config.clone();
-        let recorder = self.build();
-        let handle = recorder.handle();
-
-        if let Some(address) = &address {
-            let server = Server::try_bind(&address)?;
-            let exporter = async move {
-                let make_svc = make_service_fn(move |socket: &AddrStream| {
-                    let remote_addr = socket.remote_addr().ip();
-                    let allowed = allow_ips
-                        .as_ref()
-                        .map(|subnets| subnets.iter().any(|subnet| subnet.contains(&remote_addr)))
-                        // If no subnets specified, allow all IPs.
-                        .unwrap_or(true);
-
-                    let handle = handle.clone();
-
-                    async move {
-                        Ok::<_, HyperError>(service_fn(move |_| {
-                            let handle = handle.clone();
-
-                            async move {
-                                if allowed {
-                                    let output = handle.render();
-                                    Ok::<_, HyperError>(Response::new(Body::from(output)))
-                                } else {
-                                    Ok::<_, HyperError>(
-                                        Response::builder()
-                                            .status(StatusCode::FORBIDDEN)
-                                            .body(Body::empty())
-                                            .expect("static response is valid"),
-                                    )
-                                }
-                            }
-                        }))
-                    }
-                });
-                server.serve(make_svc).await
-            };
-            return Ok((recorder, Box::pin(exporter)));
-        }
-
-        #[cfg(feature = "push-gateway")]
-        if let Some(push_gateway_config) = &push_gateway_config {
-            let push_interval = push_gateway_config.push_interval;
-            let push_address = push_gateway_config.address.to_string();
-            let exporter = async move {
-                let client = reqwest::Client::default();
-                loop {
-                    tokio::time::sleep(push_interval).await;
-                    let output = handle.render();
-                    let response = client.put(push_address.as_str()).body(output).send().await;
-                    match response {
-                        Ok(response) => {
-                            if let Err(e) = response.error_for_status() {
-                                tracing::error!(
-                                    "error status code for pushing metrics to push gateway: {:?}",
-                                    e
-                                )
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("error pushing metrics to push gateway: {:?}", e)
-                        }
-                    }
-                }
-            };
-            return Ok((recorder, Box::pin(exporter)));
-        }
-
-        unimplemented!("must specify at least one of listen_address or push_gateway_config");
     }
 }
 
@@ -353,17 +529,18 @@ mod tests {
 
     use quanta::Clock;
 
-    use metrics::{GaugeValue, Key, Label, Recorder};
+    use metrics::{Key, KeyName, Label, Recorder};
     use metrics_util::MetricKindMask;
 
     use super::{Matcher, PrometheusBuilder};
 
     #[test]
     fn test_render() {
-        let recorder = PrometheusBuilder::new().build();
+        let recorder = PrometheusBuilder::new().build_recorder();
 
         let key = Key::from_name("basic_counter");
-        recorder.increment_counter(&key, 42);
+        let counter1 = recorder.register_counter(&key);
+        counter1.increment(42);
 
         let handle = recorder.handle();
         let rendered = handle.render();
@@ -373,7 +550,8 @@ mod tests {
 
         let labels = vec![Label::new("wutang", "forever")];
         let key = Key::from_parts("basic_gauge", labels);
-        recorder.update_gauge(&key, GaugeValue::Absolute(-3.14));
+        let gauge1 = recorder.register_gauge(&key);
+        gauge1.set(-3.14);
         let rendered = handle.render();
         let expected_gauge = format!(
             "{}# TYPE basic_gauge gauge\nbasic_gauge{{wutang=\"forever\"}} -3.14\n\n",
@@ -383,7 +561,8 @@ mod tests {
         assert_eq!(rendered, expected_gauge);
 
         let key = Key::from_name("basic_histogram");
-        recorder.record_histogram(&key, 12.0);
+        let histogram1 = recorder.register_histogram(&key);
+        histogram1.record(12.0);
         let rendered = handle.render();
 
         let histogram_data = concat!(
@@ -416,25 +595,33 @@ mod tests {
                 Matcher::Full("metrics.testing foo".to_owned()),
                 &FULL_VALUES[..],
             )
+            .expect("bounds should not be empty")
             .set_buckets_for_metric(
                 Matcher::Prefix("metrics.testing".to_owned()),
                 &PREFIX_VALUES[..],
             )
+            .expect("bounds should not be empty")
             .set_buckets_for_metric(Matcher::Suffix("foo".to_owned()), &SUFFIX_VALUES[..])
+            .expect("bounds should not be empty")
             .set_buckets(&DEFAULT_VALUES[..])
-            .build();
+            .expect("bounds should not be empty")
+            .build_recorder();
 
         let full_key = Key::from_name("metrics.testing_foo");
-        recorder.record_histogram(&full_key, FULL_VALUES[0]);
+        let full_key_histo = recorder.register_histogram(&full_key);
+        full_key_histo.record(FULL_VALUES[0]);
 
         let prefix_key = Key::from_name("metrics.testing_bar");
-        recorder.record_histogram(&prefix_key, PREFIX_VALUES[1]);
+        let prefix_key_histo = recorder.register_histogram(&prefix_key);
+        prefix_key_histo.record(PREFIX_VALUES[1]);
 
         let suffix_key = Key::from_name("metrics_testin_foo");
-        recorder.record_histogram(&suffix_key, SUFFIX_VALUES[2]);
+        let suffix_key_histo = recorder.register_histogram(&suffix_key);
+        suffix_key_histo.record(SUFFIX_VALUES[2]);
 
         let default_key = Key::from_name("metrics.wee");
-        recorder.record_histogram(&default_key, DEFAULT_VALUES[2] + 1.0);
+        let default_key_histo = recorder.register_histogram(&default_key);
+        default_key_histo.record(DEFAULT_VALUES[2] + 1.0);
 
         let full_data = concat!(
             "# TYPE metrics_testing_foo histogram\n",
@@ -486,18 +673,24 @@ mod tests {
     }
 
     #[test]
-    fn test_idle_timeout() {
+    fn test_idle_timeout_all() {
         let (clock, mock) = Clock::mock();
 
         let recorder = PrometheusBuilder::new()
-            .idle_timeout(MetricKindMask::COUNTER, Some(Duration::from_secs(10)))
+            .idle_timeout(MetricKindMask::ALL, Some(Duration::from_secs(10)))
             .build_with_clock(clock);
 
         let key = Key::from_name("basic_counter");
-        recorder.increment_counter(&key, 42);
+        let counter1 = recorder.register_counter(&key);
+        counter1.increment(42);
 
         let key = Key::from_name("basic_gauge");
-        recorder.update_gauge(&key, GaugeValue::Absolute(-3.14));
+        let gauge1 = recorder.register_gauge(&key);
+        gauge1.set(-3.14);
+
+        let key = Key::from_name("basic_histogram");
+        let histo1 = recorder.register_histogram(&key);
+        histo1.record(1.0);
 
         let handle = recorder.handle();
         let rendered = handle.render();
@@ -506,6 +699,69 @@ mod tests {
             "basic_counter 42\n\n",
             "# TYPE basic_gauge gauge\n",
             "basic_gauge -3.14\n\n",
+            "# TYPE basic_histogram summary\n",
+            "basic_histogram{quantile=\"0\"} 1\n",
+            "basic_histogram{quantile=\"0.5\"} 1\n",
+            "basic_histogram{quantile=\"0.9\"} 1\n",
+            "basic_histogram{quantile=\"0.95\"} 1\n",
+            "basic_histogram{quantile=\"0.99\"} 1\n",
+            "basic_histogram{quantile=\"0.999\"} 1\n",
+            "basic_histogram{quantile=\"1\"} 1\n",
+            "basic_histogram_sum 1\n",
+            "basic_histogram_count 1\n\n",
+        );
+
+        assert_eq!(rendered, expected);
+
+        mock.increment(Duration::from_secs(9));
+        let rendered = handle.render();
+        assert_eq!(rendered, expected);
+
+        mock.increment(Duration::from_secs(2));
+        let rendered = handle.render();
+        assert_eq!(rendered, "");
+    }
+
+    #[test]
+    fn test_idle_timeout_partial() {
+        let (clock, mock) = Clock::mock();
+
+        let recorder = PrometheusBuilder::new()
+            .idle_timeout(
+                MetricKindMask::COUNTER | MetricKindMask::HISTOGRAM,
+                Some(Duration::from_secs(10)),
+            )
+            .build_with_clock(clock);
+
+        let key = Key::from_name("basic_counter");
+        let counter1 = recorder.register_counter(&key);
+        counter1.increment(42);
+
+        let key = Key::from_name("basic_gauge");
+        let gauge1 = recorder.register_gauge(&key);
+        gauge1.set(-3.14);
+
+        let key = Key::from_name("basic_histogram");
+        let histo1 = recorder.register_histogram(&key);
+        histo1.record(1.0);
+
+        let handle = recorder.handle();
+        let rendered = handle.render();
+        let expected = concat!(
+            "# TYPE basic_counter counter\n",
+            "basic_counter 42\n\n",
+            "# TYPE basic_gauge gauge\n",
+            "basic_gauge -3.14\n\n",
+            "# TYPE basic_histogram summary\n",
+            "basic_histogram{quantile=\"0\"} 1\n",
+            "basic_histogram{quantile=\"0.5\"} 1\n",
+            "basic_histogram{quantile=\"0.9\"} 1\n",
+            "basic_histogram{quantile=\"0.95\"} 1\n",
+            "basic_histogram{quantile=\"0.99\"} 1\n",
+            "basic_histogram{quantile=\"0.999\"} 1\n",
+            "basic_histogram{quantile=\"1\"} 1\n",
+            "basic_histogram_sum 1\n",
+            "basic_histogram_count 1\n\n",
         );
 
         assert_eq!(rendered, expected);
@@ -522,13 +778,158 @@ mod tests {
     }
 
     #[test]
+    fn test_idle_timeout_staggered_distributions() {
+        let (clock, mock) = Clock::mock();
+
+        let recorder = PrometheusBuilder::new()
+            .idle_timeout(MetricKindMask::ALL, Some(Duration::from_secs(10)))
+            .build_with_clock(clock);
+
+        let key = Key::from_name("basic_counter");
+        let counter1 = recorder.register_counter(&key);
+        counter1.increment(42);
+
+        let key = Key::from_name("basic_gauge");
+        let gauge1 = recorder.register_gauge(&key);
+        gauge1.set(-3.14);
+
+        let key = Key::from_name("basic_histogram");
+        let histo1 = recorder.register_histogram(&key);
+        histo1.record(1.0);
+
+        let handle = recorder.handle();
+        let rendered = handle.render();
+        let expected = concat!(
+            "# TYPE basic_counter counter\n",
+            "basic_counter 42\n\n",
+            "# TYPE basic_gauge gauge\n",
+            "basic_gauge -3.14\n\n",
+            "# TYPE basic_histogram summary\n",
+            "basic_histogram{quantile=\"0\"} 1\n",
+            "basic_histogram{quantile=\"0.5\"} 1\n",
+            "basic_histogram{quantile=\"0.9\"} 1\n",
+            "basic_histogram{quantile=\"0.95\"} 1\n",
+            "basic_histogram{quantile=\"0.99\"} 1\n",
+            "basic_histogram{quantile=\"0.999\"} 1\n",
+            "basic_histogram{quantile=\"1\"} 1\n",
+            "basic_histogram_sum 1\n",
+            "basic_histogram_count 1\n\n",
+        );
+
+        assert_eq!(rendered, expected);
+
+        mock.increment(Duration::from_secs(9));
+        let rendered = handle.render();
+        assert_eq!(rendered, expected);
+
+        let key = Key::from_parts("basic_histogram", vec![Label::new("type", "special")]);
+        let histo2 = recorder.register_histogram(&key);
+        histo2.record(2.0);
+
+        let expected_second = concat!(
+            "# TYPE basic_counter counter\n",
+            "basic_counter 42\n\n",
+            "# TYPE basic_gauge gauge\n",
+            "basic_gauge -3.14\n\n",
+            "# TYPE basic_histogram summary\n",
+            "basic_histogram{quantile=\"0\"} 1\n",
+            "basic_histogram{quantile=\"0.5\"} 1\n",
+            "basic_histogram{quantile=\"0.9\"} 1\n",
+            "basic_histogram{quantile=\"0.95\"} 1\n",
+            "basic_histogram{quantile=\"0.99\"} 1\n",
+            "basic_histogram{quantile=\"0.999\"} 1\n",
+            "basic_histogram{quantile=\"1\"} 1\n",
+            "basic_histogram_sum 1\n",
+            "basic_histogram_count 1\n",
+            "basic_histogram{type=\"special\",quantile=\"0\"} 2\n",
+            "basic_histogram{type=\"special\",quantile=\"0.5\"} 2\n",
+            "basic_histogram{type=\"special\",quantile=\"0.9\"} 2\n",
+            "basic_histogram{type=\"special\",quantile=\"0.95\"} 2\n",
+            "basic_histogram{type=\"special\",quantile=\"0.99\"} 2\n",
+            "basic_histogram{type=\"special\",quantile=\"0.999\"} 2\n",
+            "basic_histogram{type=\"special\",quantile=\"1\"} 2\n",
+            "basic_histogram_sum{type=\"special\"} 2\n",
+            "basic_histogram_count{type=\"special\"} 1\n\n",
+        );
+        let rendered = handle.render();
+        assert_eq!(rendered, expected_second);
+
+        let expected_after = concat!(
+            "# TYPE basic_histogram summary\n",
+            "basic_histogram{type=\"special\",quantile=\"0\"} 2\n",
+            "basic_histogram{type=\"special\",quantile=\"0.5\"} 2\n",
+            "basic_histogram{type=\"special\",quantile=\"0.9\"} 2\n",
+            "basic_histogram{type=\"special\",quantile=\"0.95\"} 2\n",
+            "basic_histogram{type=\"special\",quantile=\"0.99\"} 2\n",
+            "basic_histogram{type=\"special\",quantile=\"0.999\"} 2\n",
+            "basic_histogram{type=\"special\",quantile=\"1\"} 2\n",
+            "basic_histogram_sum{type=\"special\"} 2\n",
+            "basic_histogram_count{type=\"special\"} 1\n\n",
+        );
+
+        mock.increment(Duration::from_secs(2));
+        let rendered = handle.render();
+        assert_eq!(rendered, expected_after);
+    }
+
+    #[test]
+    fn test_idle_timeout_doesnt_remove_recents() {
+        let (clock, mock) = Clock::mock();
+
+        let recorder = PrometheusBuilder::new()
+            .idle_timeout(MetricKindMask::ALL, Some(Duration::from_secs(10)))
+            .build_with_clock(clock);
+
+        let key = Key::from_name("basic_counter");
+        let counter1 = recorder.register_counter(&key);
+        counter1.increment(42);
+
+        let key = Key::from_name("basic_gauge");
+        let gauge1 = recorder.register_gauge(&key);
+        gauge1.set(-3.14);
+
+        let handle = recorder.handle();
+        let rendered = handle.render();
+        let expected = concat!(
+            "# TYPE basic_counter counter\n",
+            "basic_counter 42\n\n",
+            "# TYPE basic_gauge gauge\n",
+            "basic_gauge -3.14\n\n",
+        );
+
+        assert_eq!(rendered, expected);
+
+        mock.increment(Duration::from_secs(9));
+        let rendered = handle.render();
+        assert_eq!(rendered, expected);
+
+        let expected_second = concat!(
+            "# TYPE basic_counter counter\n",
+            "basic_counter 42\n\n",
+            "# TYPE basic_gauge gauge\n",
+            "basic_gauge -3.14\n\n",
+        );
+        let rendered = handle.render();
+        assert_eq!(rendered, expected_second);
+
+        counter1.increment(1);
+
+        let expected_after = concat!("# TYPE basic_counter counter\n", "basic_counter 43\n\n",);
+
+        mock.increment(Duration::from_secs(2));
+        let rendered = handle.render();
+        assert_eq!(rendered, expected_after);
+    }
+
+    #[test]
     pub fn test_global_labels() {
         let recorder = PrometheusBuilder::new()
             .add_global_label("foo", "foo")
             .add_global_label("foo", "bar")
-            .build();
+            .build_recorder();
         let key = Key::from_name("basic_counter");
-        recorder.increment_counter(&key, 42);
+        let counter1 = recorder.register_counter(&key);
+        counter1.increment(42);
 
         let handle = recorder.handle();
         let rendered = handle.render();
@@ -539,17 +940,34 @@ mod tests {
 
     #[test]
     pub fn test_global_labels_overrides() {
-        let recorder = PrometheusBuilder::new()
-            .add_global_label("foo", "foo")
-            .build();
+        let recorder = PrometheusBuilder::new().add_global_label("foo", "foo").build_recorder();
 
         let key =
             Key::from_name("overridden").with_extra_labels(vec![Label::new("foo", "overridden")]);
-        recorder.increment_counter(&key, 1);
+        let counter1 = recorder.register_counter(&key);
+        counter1.increment(1);
 
         let handle = recorder.handle();
         let rendered = handle.render();
         let expected_counter = "# TYPE overridden counter\noverridden{foo=\"overridden\"} 1\n\n";
+
+        assert_eq!(rendered, expected_counter);
+    }
+
+    #[test]
+    pub fn test_sanitized_render() {
+        let recorder = PrometheusBuilder::new().add_global_label("foo:", "foo").build_recorder();
+
+        let key_name = KeyName::from("yee_haw:lets go");
+        let key = Key::from_name(key_name.clone())
+            .with_extra_labels(vec![Label::new("øhno", "\"yeet\nies\\\"")]);
+        recorder.describe_counter(key_name, None, "\"Simplë stuff.\nRëally.\"");
+        let counter1 = recorder.register_counter(&key);
+        counter1.increment(1);
+
+        let handle = recorder.handle();
+        let rendered = handle.render();
+        let expected_counter = "# HELP yee_haw:lets_go \"Simplë stuff.\\nRëally.\"\n# TYPE yee_haw:lets_go counter\nyee_haw:lets_go{foo_=\"foo\",_hno=\"\\\"yeet\\nies\\\"\"} 1\n\n";
 
         assert_eq!(rendered, expected_counter);
     }

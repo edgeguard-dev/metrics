@@ -56,11 +56,7 @@ impl Client {
             })
         };
 
-        Client {
-            state,
-            metrics,
-            metadata,
-        }
+        Client { state, metrics, metadata }
     }
 
     pub fn state(&self) -> ClientState {
@@ -107,13 +103,7 @@ impl Runner {
         metrics: Arc<RwLock<BTreeMap<CompositeKey, MetricData>>>,
         metadata: Arc<RwLock<HashMap<(MetricKind, String), (Option<Unit>, Option<String>)>>>,
     ) -> Runner {
-        Runner {
-            state: RunnerState::Disconnected,
-            addr,
-            client_state: state,
-            metrics,
-            metadata,
-        }
+        Runner { state: RunnerState::Disconnected, addr, client_state: state, metrics, metadata }
     }
 
     pub fn run(&mut self) {
@@ -229,10 +219,8 @@ impl Runner {
 
                                     match metric.value.expect("no metric value") {
                                         proto::metric::Value::Counter(value) => {
-                                            let key = CompositeKey::new(
-                                                MetricKind::Counter,
-                                                key_data.into(),
-                                            );
+                                            let key =
+                                                CompositeKey::new(MetricKind::Counter, key_data);
                                             let mut metrics = self.metrics.write().unwrap();
                                             let counter = metrics
                                                 .entry(key)
@@ -242,10 +230,8 @@ impl Runner {
                                             }
                                         }
                                         proto::metric::Value::Gauge(value) => {
-                                            let key = CompositeKey::new(
-                                                MetricKind::Gauge,
-                                                key_data.into(),
-                                            );
+                                            let key =
+                                                CompositeKey::new(MetricKind::Gauge, key_data);
                                             let mut metrics = self.metrics.write().unwrap();
                                             let gauge = metrics
                                                 .entry(key)
@@ -266,10 +252,8 @@ impl Runner {
                                             }
                                         }
                                         proto::metric::Value::Histogram(value) => {
-                                            let key = CompositeKey::new(
-                                                MetricKind::Histogram,
-                                                key_data.into(),
-                                            );
+                                            let key =
+                                                CompositeKey::new(MetricKind::Histogram, key_data);
                                             let mut metrics = self.metrics.write().unwrap();
                                             let histogram =
                                                 metrics.entry(key).or_insert_with(|| {

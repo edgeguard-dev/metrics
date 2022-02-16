@@ -11,7 +11,7 @@ use tracing_subscriber::{layer::Context, registry::LookupSpan, Layer};
 
 fn get_pool() -> &'static Arc<LinearObjectPool<Vec<Label>>> {
     static POOL: OnceCell<Arc<LinearObjectPool<Vec<Label>>>> = OnceCell::new();
-    POOL.get_or_init(|| Arc::new(LinearObjectPool::new(|| Vec::new(), |vec| vec.clear())))
+    POOL.get_or_init(|| Arc::new(LinearObjectPool::new(Vec::new, Vec::clear)))
 }
 /// Span fields mapped as metrics labels.
 ///
@@ -34,7 +34,7 @@ impl Default for Labels {
 
 impl Visit for Labels {
     fn record_str(&mut self, field: &Field, value: &str) {
-        let label = Label::new(field.name(), value.to_owned());
+        let label = Label::new(field.name(), value.to_string());
         self.0.push(label);
     }
 
@@ -44,18 +44,16 @@ impl Visit for Labels {
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
-        // Maximum length is 20 characters but 32 is a nice power-of-two number.
-        let mut s = String::with_capacity(20);
-        itoa::fmt(&mut s, value).expect("failed to format/write i64");
-        let label = Label::new(field.name(), s);
+        let mut buf = itoa::Buffer::new();
+        let s = buf.format(value);
+        let label = Label::new(field.name(), s.to_string());
         self.0.push(label);
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        // Maximum length is 20 characters but 32 is a nice power-of-two number.
-        let mut s = String::with_capacity(20);
-        itoa::fmt(&mut s, value).expect("failed to format/write u64");
-        let label = Label::new(field.name(), s);
+        let mut buf = itoa::Buffer::new();
+        let s = buf.format(value);
+        let label = Label::new(field.name(), s.to_string());
         self.0.push(label);
     }
 
@@ -110,14 +108,9 @@ where
 {
     /// Create a new `MetricsLayer`.
     pub fn new() -> Self {
-        let ctx = WithContext {
-            with_labels: Self::with_labels,
-        };
+        let ctx = WithContext { with_labels: Self::with_labels };
 
-        Self {
-            ctx,
-            _subscriber: PhantomData,
-        }
+        Self { ctx, _subscriber: PhantomData }
     }
 
     fn with_labels(
@@ -128,15 +121,10 @@ where
         let subscriber = dispatch
             .downcast_ref::<S>()
             .expect("subscriber should downcast to expected type; this is a bug!");
-        let span = subscriber
-            .span(id)
-            .expect("registry should have a span for the current ID");
+        let span = subscriber.span(id).expect("registry should have a span for the current ID");
 
-        let result = if let Some(labels) = span.extensions().get::<Labels>() {
-            f(labels)
-        } else {
-            None
-        };
+        let result =
+            if let Some(labels) = span.extensions().get::<Labels>() { f(labels) } else { None };
         result
     }
 }
@@ -145,7 +133,7 @@ impl<S> Layer<S> for MetricsLayer<S>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    fn new_span(&self, attrs: &Attributes<'_>, id: &Id, cx: Context<'_, S>) {
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, cx: Context<'_, S>) {
         let span = cx.span(id).expect("span must already exist!");
         let mut labels = Labels::from_attributes(attrs);
 

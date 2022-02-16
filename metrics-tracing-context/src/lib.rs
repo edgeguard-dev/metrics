@@ -11,9 +11,9 @@
 //! ```rust
 //! # use metrics_util::DebuggingRecorder;
 //! # use tracing_subscriber::Registry;
+//! use metrics_tracing_context::{MetricsLayer, TracingContextLayer};
 //! use metrics_util::layers::Layer;
 //! use tracing_subscriber::layer::SubscriberExt;
-//! use metrics_tracing_context::{MetricsLayer, TracingContextLayer};
 //!
 //! // Prepare tracing.
 //! # let my_subscriber = Registry::default();
@@ -93,9 +93,9 @@
 //! modern systems, but may represent an unacceptable amount of memory usage on constrained systems
 //! such as embedded platforms, etc.
 #![deny(missing_docs)]
-#![cfg_attr(docsrs, feature(doc_cfg), deny(broken_intra_doc_links))]
+#![cfg_attr(docsrs, feature(doc_cfg), deny(rustdoc::broken_intra_doc_links))]
 
-use metrics::{GaugeValue, Key, Label, Recorder, Unit};
+use metrics::{Counter, Gauge, Histogram, Key, KeyName, Label, Recorder, Unit};
 use metrics_util::layers::Layer;
 
 pub mod label_filter;
@@ -121,9 +121,7 @@ impl<F> TracingContextLayer<F> {
 impl TracingContextLayer<label_filter::IncludeAll> {
     /// Creates a new [`TracingContextLayer`].
     pub fn all() -> Self {
-        Self {
-            label_filter: label_filter::IncludeAll,
-        }
+        Self { label_filter: label_filter::IncludeAll }
     }
 }
 
@@ -134,10 +132,7 @@ where
     type Output = TracingContext<R, F>;
 
     fn layer(&self, inner: R) -> Self::Output {
-        TracingContext {
-            inner,
-            label_filter: self.label_filter.clone(),
-        }
+        TracingContext { inner, label_filter: self.label_filter.clone() }
     }
 }
 
@@ -196,33 +191,33 @@ where
     R: Recorder,
     F: LabelFilter,
 {
-    fn register_counter(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
-        self.inner.register_counter(key, unit, description)
+    fn describe_counter(&self, key_name: KeyName, unit: Option<Unit>, description: &'static str) {
+        self.inner.describe_counter(key_name, unit, description)
     }
 
-    fn register_gauge(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
-        self.inner.register_gauge(key, unit, description)
+    fn describe_gauge(&self, key_name: KeyName, unit: Option<Unit>, description: &'static str) {
+        self.inner.describe_gauge(key_name, unit, description)
     }
 
-    fn register_histogram(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
-        self.inner.register_histogram(key, unit, description)
+    fn describe_histogram(&self, key_name: KeyName, unit: Option<Unit>, description: &'static str) {
+        self.inner.describe_histogram(key_name, unit, description)
     }
 
-    fn increment_counter(&self, key: &Key, value: u64) {
+    fn register_counter(&self, key: &Key) -> Counter {
         let new_key = self.enhance_key(key);
         let key = new_key.as_ref().unwrap_or(key);
-        self.inner.increment_counter(key, value);
+        self.inner.register_counter(key)
     }
 
-    fn update_gauge(&self, key: &Key, value: GaugeValue) {
+    fn register_gauge(&self, key: &Key) -> Gauge {
         let new_key = self.enhance_key(key);
         let key = new_key.as_ref().unwrap_or(key);
-        self.inner.update_gauge(&key, value);
+        self.inner.register_gauge(key)
     }
 
-    fn record_histogram(&self, key: &Key, value: f64) {
+    fn register_histogram(&self, key: &Key) -> Histogram {
         let new_key = self.enhance_key(key);
         let key = new_key.as_ref().unwrap_or(key);
-        self.inner.record_histogram(&key, value);
+        self.inner.register_histogram(key)
     }
 }

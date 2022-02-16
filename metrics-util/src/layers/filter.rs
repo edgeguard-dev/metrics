@@ -1,6 +1,6 @@
 use crate::layers::Layer;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
-use metrics::{GaugeValue, Key, Recorder, Unit};
+use metrics::{Counter, Gauge, Histogram, Key, KeyName, Recorder, Unit};
 
 /// Filters and discards metrics matching certain name patterns.
 ///
@@ -11,52 +11,52 @@ pub struct Filter<R> {
 }
 
 impl<R> Filter<R> {
-    fn should_filter(&self, key: &Key) -> bool {
-        self.automaton.is_match(key.name())
+    fn should_filter(&self, key: &str) -> bool {
+        self.automaton.is_match(key)
     }
 }
 
 impl<R: Recorder> Recorder for Filter<R> {
-    fn register_counter(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
-        if self.should_filter(&key) {
+    fn describe_counter(&self, key_name: KeyName, unit: Option<Unit>, description: &'static str) {
+        if self.should_filter(key_name.as_str()) {
             return;
         }
-        self.inner.register_counter(key, unit, description)
+        self.inner.describe_counter(key_name, unit, description)
     }
 
-    fn register_gauge(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
-        if self.should_filter(&key) {
+    fn describe_gauge(&self, key_name: KeyName, unit: Option<Unit>, description: &'static str) {
+        if self.should_filter(key_name.as_str()) {
             return;
         }
-        self.inner.register_gauge(key, unit, description)
+        self.inner.describe_gauge(key_name, unit, description)
     }
 
-    fn register_histogram(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
-        if self.should_filter(&key) {
+    fn describe_histogram(&self, key_name: KeyName, unit: Option<Unit>, description: &'static str) {
+        if self.should_filter(key_name.as_str()) {
             return;
         }
-        self.inner.register_histogram(key, unit, description)
+        self.inner.describe_histogram(key_name, unit, description)
     }
 
-    fn increment_counter(&self, key: &Key, value: u64) {
-        if self.should_filter(&key) {
-            return;
+    fn register_counter(&self, key: &Key) -> Counter {
+        if self.should_filter(key.name()) {
+            return Counter::noop();
         }
-        self.inner.increment_counter(key, value);
+        self.inner.register_counter(key)
     }
 
-    fn update_gauge(&self, key: &Key, value: GaugeValue) {
-        if self.should_filter(&key) {
-            return;
+    fn register_gauge(&self, key: &Key) -> Gauge {
+        if self.should_filter(key.name()) {
+            return Gauge::noop();
         }
-        self.inner.update_gauge(key, value);
+        self.inner.register_gauge(key)
     }
 
-    fn record_histogram(&self, key: &Key, value: f64) {
-        if self.should_filter(&key) {
-            return;
+    fn register_histogram(&self, key: &Key) -> Histogram {
+        if self.should_filter(key.name()) {
+            return Histogram::noop();
         }
-        self.inner.record_histogram(key, value);
+        self.inner.register_histogram(key)
     }
 }
 
@@ -88,10 +88,7 @@ impl FilterLayer {
         I: AsRef<str>,
     {
         FilterLayer {
-            patterns: patterns
-                .into_iter()
-                .map(|s| s.as_ref().to_string())
-                .collect(),
+            patterns: patterns.into_iter().map(|s| s.as_ref().to_string()).collect(),
             case_insensitive: false,
             use_dfa: true,
         }
@@ -153,92 +150,136 @@ impl<R> Layer<R> for FilterLayer {
 #[cfg(test)]
 mod tests {
     use super::FilterLayer;
-    use crate::debugging::DebuggingRecorder;
-    use crate::layers::Layer;
-    use metrics::{Recorder, Unit};
+    use crate::{layers::Layer, test_util::*};
+    use metrics::{Counter, Gauge, Histogram, Unit};
 
     #[test]
     fn test_basic_functionality() {
-        let patterns = &["tokio", "bb8"];
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let filter = FilterLayer::from_patterns(patterns);
-        let layered = filter.layer(recorder);
-
-        let tlkey = "tokio.loops".into();
-        let hsbkey = "hyper.sent_bytes".into();
-        let htsbkey = "hyper.tokio.sent_bytes".into();
-        let bckey = "bb8.conns".into();
-        let hrbkey = "hyper.recv_bytes".into();
-
-        let before = snapshotter.snapshot();
-        assert_eq!(before.len(), 0);
-
-        let ud = &[
-            (Unit::Count, "counter desc"),
-            (Unit::Bytes, "gauge desc"),
-            (Unit::Bytes, "histogram desc"),
-            (Unit::Count, "counter desc"),
-            (Unit::Bytes, "gauge desc"),
+        let inputs = vec![
+            RecorderOperation::DescribeCounter(
+                "tokio.loops".into(),
+                Some(Unit::Count),
+                "counter desc",
+            ),
+            RecorderOperation::DescribeGauge(
+                "hyper.bytes_read".into(),
+                Some(Unit::Bytes),
+                "gauge desc",
+            ),
+            RecorderOperation::DescribeHistogram(
+                "hyper.response_latency".into(),
+                Some(Unit::Nanoseconds),
+                "histogram desc",
+            ),
+            RecorderOperation::DescribeCounter(
+                "tokio.spurious_wakeups".into(),
+                Some(Unit::Count),
+                "counter desc",
+            ),
+            RecorderOperation::DescribeGauge(
+                "bb8.pooled_conns".into(),
+                Some(Unit::Count),
+                "gauge desc",
+            ),
+            RecorderOperation::RegisterCounter("tokio.loops".into(), Counter::noop()),
+            RecorderOperation::RegisterGauge("hyper.bytes_read".into(), Gauge::noop()),
+            RecorderOperation::RegisterHistogram(
+                "hyper.response_latency".into(),
+                Histogram::noop(),
+            ),
+            RecorderOperation::RegisterCounter("tokio.spurious_wakeups".into(), Counter::noop()),
+            RecorderOperation::RegisterGauge("bb8.pooled_conns".into(), Gauge::noop()),
         ];
 
-        layered.register_counter(&tlkey, Some(ud[0].0.clone()), Some(ud[0].1));
-        layered.register_gauge(&hsbkey, Some(ud[1].0.clone()), Some(ud[1].1));
-        layered.register_histogram(&htsbkey, Some(ud[2].0.clone()), Some(ud[2].1));
-        layered.register_counter(&bckey, Some(ud[3].0.clone()), Some(ud[3].1));
-        layered.register_gauge(&hrbkey, Some(ud[4].0.clone()), Some(ud[4].1));
+        let expectations = vec![
+            RecorderOperation::DescribeGauge(
+                "hyper.bytes_read".into(),
+                Some(Unit::Bytes),
+                "gauge desc",
+            ),
+            RecorderOperation::DescribeHistogram(
+                "hyper.response_latency".into(),
+                Some(Unit::Nanoseconds),
+                "histogram desc",
+            ),
+            RecorderOperation::RegisterGauge("hyper.bytes_read".into(), Gauge::noop()),
+            RecorderOperation::RegisterHistogram(
+                "hyper.response_latency".into(),
+                Histogram::noop(),
+            ),
+        ];
 
-        let after = snapshotter.snapshot();
-        assert_eq!(after.len(), 2);
+        let recorder = MockBasicRecorder::from_operations(expectations);
+        let filter = FilterLayer::from_patterns(&["tokio", "bb8"]);
+        let filter = filter.layer(recorder);
 
-        for (key, unit, desc, _value) in after {
-            assert!(
-                !key.key().name().to_string().contains("tokio")
-                    && !key.key().name().to_string().contains("bb8")
-            );
-            // We cheat here since we're not comparing one-to-one with the source data,
-            // but we know which metrics are going to make it through so we can hard code.
-            assert_eq!(Some(Unit::Bytes), unit);
-            assert!(!desc.unwrap().is_empty() && desc.unwrap() == "gauge desc");
+        for operation in inputs {
+            operation.apply_to_recorder(&filter);
         }
     }
 
     #[test]
     fn test_case_insensitivity() {
-        let patterns = &["tokio", "bb8"];
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let mut filter = FilterLayer::from_patterns(patterns.iter());
-        filter.case_insensitive(true);
-        let layered = filter.layer(recorder);
+        let inputs = vec![
+            RecorderOperation::DescribeCounter(
+                "tokiO.loops".into(),
+                Some(Unit::Count),
+                "counter desc",
+            ),
+            RecorderOperation::DescribeGauge(
+                "hyper.bytes_read".into(),
+                Some(Unit::Bytes),
+                "gauge desc",
+            ),
+            RecorderOperation::DescribeHistogram(
+                "hyper.response_latency".into(),
+                Some(Unit::Nanoseconds),
+                "histogram desc",
+            ),
+            RecorderOperation::DescribeCounter(
+                "Tokio.spurious_wakeups".into(),
+                Some(Unit::Count),
+                "counter desc",
+            ),
+            RecorderOperation::DescribeGauge(
+                "bB8.pooled_conns".into(),
+                Some(Unit::Count),
+                "gauge desc",
+            ),
+            RecorderOperation::RegisterCounter("tokiO.loops".into(), Counter::noop()),
+            RecorderOperation::RegisterGauge("hyper.bytes_read".into(), Gauge::noop()),
+            RecorderOperation::RegisterHistogram(
+                "hyper.response_latency".into(),
+                Histogram::noop(),
+            ),
+            RecorderOperation::RegisterCounter("Tokio.spurious_wakeups".into(), Counter::noop()),
+            RecorderOperation::RegisterGauge("bB8.pooled_conns".into(), Gauge::noop()),
+        ];
 
-        let before = snapshotter.snapshot();
-        assert_eq!(before.len(), 0);
+        let expectations = vec![
+            RecorderOperation::DescribeGauge(
+                "hyper.bytes_read".into(),
+                Some(Unit::Bytes),
+                "gauge desc",
+            ),
+            RecorderOperation::DescribeHistogram(
+                "hyper.response_latency".into(),
+                Some(Unit::Nanoseconds),
+                "histogram desc",
+            ),
+            RecorderOperation::RegisterGauge("hyper.bytes_read".into(), Gauge::noop()),
+            RecorderOperation::RegisterHistogram(
+                "hyper.response_latency".into(),
+                Histogram::noop(),
+            ),
+        ];
 
-        let tlkey = "tokiO.loops".into();
-        let hsbkey = "hyper.sent_bytes".into();
-        let hrbkey = "hyper.recv_bytes".into();
-        let bckey = "bb8.conns".into();
-        let bcckey = "Bb8.conns_closed".into();
+        let recorder = MockBasicRecorder::from_operations(expectations);
+        let mut filter = FilterLayer::from_patterns(&["tokio", "bb8"]);
+        let filter = filter.case_insensitive(true).layer(recorder);
 
-        layered.register_counter(&tlkey, None, None);
-        layered.register_gauge(&hsbkey, None, None);
-        layered.register_histogram(&hrbkey, None, None);
-        layered.register_counter(&bckey, None, None);
-        layered.register_counter(&bcckey, None, None);
-
-        let after = snapshotter.snapshot();
-        assert_eq!(after.len(), 2);
-
-        for (key, _unit, _desc, _value) in &after {
-            assert!(
-                !key.key()
-                    .name()
-                    .to_string()
-                    .to_lowercase()
-                    .contains("tokio")
-                    && !key.key().name().to_string().to_lowercase().contains("bb8")
-            );
+        for operation in inputs {
+            operation.apply_to_recorder(&filter);
         }
     }
 }

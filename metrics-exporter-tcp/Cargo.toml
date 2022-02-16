@@ -1,6 +1,6 @@
 [package]
 name = "metrics-exporter-tcp"
-version = "0.5.1"
+version = "0.6.0"
 authors = ["Toby Lawrence <toby@nuclearfurnace.com>"]
 edition = "2018"
 
@@ -16,20 +16,19 @@ categories = ["development-tools::debugging"]
 keywords = ["metrics", "telemetry", "tcp"]
 
 [dependencies]
-metrics = { version = "^0.17", path = "../metrics", features = ["std"] }
-bytes = "1.0"
-crossbeam-channel = "0.5"
-prost = "0.7"
-prost-types = "0.7"
-mio = { version = "0.7", features = ["os-poll", "tcp"] }
-tracing = "0.1"
+metrics = { version = "^0.18", path = "../metrics" }
+bytes = { version = "1", default-features = false }
+crossbeam-channel = { version = "0.5", default-features = false, features = ["std"] }
+prost = { version = "0.9", default-features = false }
+prost-types = { version = "0.9", default-features = false, features = ["std"] }
+mio = { version = "0.8", default-features = false, features = ["os-poll", "net"] }
+tracing = { version = "0.1", default-features = false, features = ["attributes"] }
 
 [build-dependencies]
-prost-build = "0.7"
-built = "0.4"
+prost-build = "0.9"
 
 [dev-dependencies]
 quanta = "0.9.3"
 tracing = "0.1"
-tracing-subscriber = "0.2"
+tracing-subscriber = "0.3"
 rand = "0.8"
