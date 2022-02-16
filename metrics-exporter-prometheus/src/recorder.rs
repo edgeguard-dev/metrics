@@ -31,14 +31,26 @@ pub(crate) struct Export<'a, T: serde::Serialize> {
 }
 
 impl<'a, T: serde::Serialize> Export<'a, T> {
-    pub fn new(name: &'a str, value: T, labels: &'a Vec<String>, additional_label: &'a Option<String>) -> Self {
+    pub fn new(
+        name: &'a str,
+        value: T,
+        labels: &'a Vec<String>,
+        additional_label: &'a Option<String>,
+    ) -> Self {
         Export {
             name,
             value,
-            tags: labels.iter().chain(additional_label.iter()).map(|kv| {
-                let mut kvs = kv.split('=');
-                (kvs.next().unwrap_or_default(), kvs.next().unwrap_or_default().replace('"', ""))
-            }).collect()
+            tags: labels
+                .iter()
+                .chain(additional_label.iter())
+                .map(|kv| {
+                    let mut kvs = kv.split('=');
+                    (
+                        kvs.next().unwrap_or_default(),
+                        kvs.next().unwrap_or_default().replace('"', ""),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -122,11 +134,7 @@ impl Inner {
     }
 
     pub fn render_nd_json(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let Snapshot {
-            mut counters,
-            mut distributions,
-            mut gauges,
-        } = self.get_recent_metrics();
+        let Snapshot { mut counters, mut distributions, mut gauges } = self.get_recent_metrics();
         let mut output = vec![];
 
         for (name, mut by_labels) in counters.drain() {
