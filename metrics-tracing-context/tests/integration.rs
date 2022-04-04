@@ -1,8 +1,7 @@
 use metrics::{counter, Key, Label};
 use metrics_tracing_context::{LabelFilter, MetricsLayer, TracingContextLayer};
-use metrics_util::{
-    layers::Layer, CompositeKey, DebugValue, DebuggingRecorder, MetricKind, Snapshotter,
-};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+use metrics_util::{layers::Layer, CompositeKey, MetricKind};
 use parking_lot::{const_mutex, Mutex, MutexGuard};
 use tracing::dispatcher::{set_default, DefaultGuard, Dispatch};
 use tracing::{span, Level};
@@ -22,6 +21,10 @@ static USER_EMAIL: &'static [Label] = &[
 static EMAIL_USER: &'static [Label] = &[
     Label::from_static_parts("user.email", "ferris@rust-lang.org"),
     Label::from_static_parts("user", "ferris"),
+];
+static SVC_ENV: &'static [Label] = &[
+    Label::from_static_parts("service", "login_service"),
+    Label::from_static_parts("env", "test"),
 ];
 static SVC_USER_EMAIL: &'static [Label] = &[
     Label::from_static_parts("service", "login_service"),
@@ -339,6 +342,37 @@ fn test_label_filtering() {
                 MetricKind::Counter,
                 Key::from_static_parts(LOGIN_ATTEMPTS, EMAIL_USER)
             ),
+            None,
+            None,
+            DebugValue::Counter(1),
+        )]
+    )
+}
+
+#[test]
+fn test_label_allowlist() {
+    let (_guard, snapshotter) = setup(TracingContextLayer::only_allow(&["env", "service"]));
+
+    let user = "ferris";
+    let email = "ferris@rust-lang.org";
+    let span = span!(
+        Level::TRACE,
+        "login",
+        user,
+        user.email_span = email,
+        service = "login_service",
+        env = "test"
+    );
+    let _guard = span.enter();
+
+    counter!("login_attempts", 1);
+
+    let snapshot = snapshotter.snapshot().into_vec();
+
+    assert_eq!(
+        snapshot,
+        vec![(
+            CompositeKey::new(MetricKind::Counter, Key::from_static_parts(LOGIN_ATTEMPTS, SVC_ENV)),
             None,
             None,
             DebugValue::Counter(1),

@@ -8,10 +8,11 @@ use metrics::{Counter, Gauge, Histogram, Key, KeyName, Recorder, Unit};
 use metrics_util::registry::{GenerationalAtomicStorage, Recency, Registry};
 use parking_lot::RwLock;
 
-use crate::common::{
-    sanitize_description, sanitize_label_key, sanitize_label_value, sanitize_metric_name, Snapshot,
-};
+use crate::common::Snapshot;
 use crate::distribution::{Distribution, DistributionBuilder};
+use crate::formatting::{
+    key_to_parts, sanitize_metric_name, write_help_line, write_metric_line, write_type_line,
+};
 
 pub(crate) struct Inner {
     pub registry: Registry<Key, GenerationalAtomicStorage>,
@@ -68,7 +69,7 @@ impl Inner {
                 continue;
             }
 
-            let (name, labels) = key_to_parts(&key, &self.global_labels);
+            let (name, labels) = key_to_parts(&key, Some(&self.global_labels));
             let value = counter.get_inner().load(Ordering::Acquire);
             let entry =
                 counters.entry(name).or_insert_with(HashMap::new).entry(labels).or_insert(0);
@@ -83,7 +84,7 @@ impl Inner {
                 continue;
             }
 
-            let (name, labels) = key_to_parts(&key, &self.global_labels);
+            let (name, labels) = key_to_parts(&key, Some(&self.global_labels));
             let value = f64::from_bits(gauge.get_inner().load(Ordering::Acquire));
             let entry =
                 gauges.entry(name).or_insert_with(HashMap::new).entry(labels).or_insert(0.0);
@@ -97,7 +98,7 @@ impl Inner {
                 // Since we store aggregated distributions directly, when we're told that a metric
                 // is not recent enough and should be/was deleted from the registry, we also need to
                 // delete it on our side as well.
-                let (name, labels) = key_to_parts(&key, &self.global_labels);
+                let (name, labels) = key_to_parts(&key, Some(&self.global_labels));
                 let mut wg = self.distributions.write();
                 let delete_by_name = if let Some(by_name) = wg.get_mut(&name) {
                     by_name.remove(&labels);
@@ -115,7 +116,7 @@ impl Inner {
                 continue;
             }
 
-            let (name, labels) = key_to_parts(&key, &self.global_labels);
+            let (name, labels) = key_to_parts(&key, Some(&self.global_labels));
 
             let mut wg = self.distributions.write();
             let entry = wg
@@ -304,7 +305,7 @@ impl PrometheusRecorder {
         PrometheusHandle { inner: self.inner.clone() }
     }
 
-    fn add_description_if_missing(&self, key_name: KeyName, description: &'static str) {
+    fn add_description_if_missing(&self, key_name: &KeyName, description: &'static str) {
         let sanitized = sanitize_metric_name(key_name.as_str());
         let mut descriptions = self.inner.descriptions.write();
         descriptions.entry(sanitized).or_insert(description);
@@ -319,11 +320,11 @@ impl From<Inner> for PrometheusRecorder {
 
 impl Recorder for PrometheusRecorder {
     fn describe_counter(&self, key_name: KeyName, _unit: Option<Unit>, description: &'static str) {
-        self.add_description_if_missing(key_name, description);
+        self.add_description_if_missing(&key_name, description);
     }
 
     fn describe_gauge(&self, key_name: KeyName, _unit: Option<Unit>, description: &'static str) {
-        self.add_description_if_missing(key_name, description);
+        self.add_description_if_missing(&key_name, description);
     }
 
     fn describe_histogram(
@@ -332,7 +333,7 @@ impl Recorder for PrometheusRecorder {
         _unit: Option<Unit>,
         description: &'static str,
     ) {
-        self.add_description_if_missing(key_name, description);
+        self.add_description_if_missing(&key_name, description);
     }
 
     fn register_counter(&self, key: &Key) -> Counter {
@@ -370,83 +371,4 @@ impl PrometheusHandle {
     pub fn render_nd_json(&self) -> Result<Vec<String>, Box<dyn Error>> {
         self.inner.render_nd_json()
     }
-}
-
-fn key_to_parts(key: &Key, defaults: &IndexMap<String, String>) -> (String, Vec<String>) {
-    let name = sanitize_metric_name(key.name());
-    let mut values = defaults.clone();
-    key.labels().into_iter().for_each(|label| {
-        values.insert(label.key().to_string(), label.value().to_string());
-    });
-    let labels = values
-        .iter()
-        .map(|(k, v)| format!("{}=\"{}\"", sanitize_label_key(k), sanitize_label_value(v)))
-        .collect();
-
-    (name, labels)
-}
-
-fn write_help_line(buffer: &mut String, name: &str, desc: &str) {
-    buffer.push_str("# HELP ");
-    buffer.push_str(name);
-    buffer.push(' ');
-    let desc = sanitize_description(desc);
-    buffer.push_str(&desc);
-    buffer.push('\n');
-}
-
-fn write_type_line(buffer: &mut String, name: &str, metric_type: &str) {
-    buffer.push_str("# TYPE ");
-    buffer.push_str(name);
-    buffer.push(' ');
-    buffer.push_str(metric_type);
-    buffer.push('\n');
-}
-
-fn write_metric_line<T, T2>(
-    buffer: &mut String,
-    name: &str,
-    suffix: Option<&'static str>,
-    labels: &[String],
-    additional_label: Option<(&'static str, T)>,
-    value: T2,
-) where
-    T: std::fmt::Display,
-    T2: std::fmt::Display,
-{
-    buffer.push_str(name);
-    if let Some(suffix) = suffix {
-        buffer.push('_');
-        buffer.push_str(suffix);
-    }
-
-    if !labels.is_empty() || additional_label.is_some() {
-        buffer.push('{');
-
-        let mut first = true;
-        for label in labels {
-            if first {
-                first = false;
-            } else {
-                buffer.push(',');
-            }
-            buffer.push_str(label);
-        }
-
-        if let Some((name, value)) = additional_label {
-            if !first {
-                buffer.push(',');
-            }
-            buffer.push_str(name);
-            buffer.push_str("=\"");
-            buffer.push_str(value.to_string().as_str());
-            buffer.push('"');
-        }
-
-        buffer.push('}');
-    }
-
-    buffer.push(' ');
-    buffer.push_str(value.to_string().as_str());
-    buffer.push('\n');
 }

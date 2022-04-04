@@ -6,7 +6,7 @@ use metrics::{CounterFn, GaugeFn, HistogramFn};
 use crate::AtomicBucket;
 
 /// Defines the underlying storage for metrics as well as how to create them.
-pub trait Storage {
+pub trait Storage<K> {
     /// The type used for counters.
     type Counter: CounterFn + Clone;
 
@@ -17,13 +17,13 @@ pub trait Storage {
     type Histogram: HistogramFn + Clone;
 
     /// Creates an empty counter.
-    fn counter() -> Self::Counter;
+    fn counter(&self, key: &K) -> Self::Counter;
 
     /// Creates an empty gauge.
-    fn gauge() -> Self::Gauge;
+    fn gauge(&self, key: &K) -> Self::Gauge;
 
     /// Creates an empty histogram.
-    fn histogram() -> Self::Histogram;
+    fn histogram(&self, key: &K) -> Self::Histogram;
 }
 
 /// Atomic metric storage.
@@ -32,20 +32,20 @@ pub trait Storage {
 /// is handling via `Arc`.
 pub struct AtomicStorage;
 
-impl Storage for AtomicStorage {
+impl<K> Storage<K> for AtomicStorage {
     type Counter = Arc<AtomicU64>;
     type Gauge = Arc<AtomicU64>;
     type Histogram = Arc<AtomicBucket<f64>>;
 
-    fn counter() -> Self::Counter {
+    fn counter(&self, _: &K) -> Self::Counter {
         Arc::new(AtomicU64::new(0))
     }
 
-    fn gauge() -> Self::Gauge {
+    fn gauge(&self, _: &K) -> Self::Gauge {
         Arc::new(AtomicU64::new(0))
     }
 
-    fn histogram() -> Self::Histogram {
+    fn histogram(&self, _: &K) -> Self::Histogram {
         Arc::new(AtomicBucket::new())
     }
 }

@@ -9,7 +9,7 @@
 //! First, set up `tracing` and `metrics` crates:
 //!
 //! ```rust
-//! # use metrics_util::DebuggingRecorder;
+//! # use metrics_util::debugging::DebuggingRecorder;
 //! # use tracing_subscriber::Registry;
 //! use metrics_tracing_context::{MetricsLayer, TracingContextLayer};
 //! use metrics_util::layers::Layer;
@@ -29,7 +29,7 @@
 //! Then emit some metrics within spans and see the labels being injected!
 //!
 //! ```rust
-//! # use metrics_util::{layers::Layer, DebuggingRecorder};
+//! # use metrics_util::{debugging::DebuggingRecorder, layers::Layer};
 //! # use tracing_subscriber::{layer::SubscriberExt, Registry};
 //! # use metrics_tracing_context::{MetricsLayer, TracingContextLayer};
 //! # let mysubscriber = Registry::default();
@@ -122,6 +122,18 @@ impl TracingContextLayer<label_filter::IncludeAll> {
     /// Creates a new [`TracingContextLayer`].
     pub fn all() -> Self {
         Self { label_filter: label_filter::IncludeAll }
+    }
+}
+
+impl TracingContextLayer<label_filter::Allowlist> {
+    /// Creates a new [`TracingContextLayer`] that only allows labels contained
+    /// in a predefined list.
+    pub fn only_allow<I, S>(allowed: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self { label_filter: label_filter::Allowlist::new(allowed) }
     }
 }
 

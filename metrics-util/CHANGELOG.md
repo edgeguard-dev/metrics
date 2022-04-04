@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - ReleaseDate
 
+## [0.12.0] - 2022-03-10
+
+### Added
+
+- New storage type, `GenerationalStorage`, that provides the generational behavior of
+  `GenerationalAtomicStorage`, nee `GenerationalPrimitives`, without being inherently coupled to
+  using atomic storage.
 ### Changed
 
 - Renamed `Primitives` to `Storage`, and publicly exposed it so that users can implement their own
@@ -18,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Created a new top-level module, `registry`, that encompasses `Registry` and all `Registry`-related
   and dependent types.
 - Exposed `DefaultHashable` publicly.
+- Debugging utilities have been moved to a new `debugging` module, and `Snapshot` is now public.
 
 ## [0.11.1] - 2022-02-20
 
