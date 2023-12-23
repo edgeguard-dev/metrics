@@ -117,6 +117,9 @@ macro_rules! counter {
     (level: $level:expr, $name:expr $(, $label_key:expr $(=> $label_value:expr)?)* $(,)?) => {
         $crate::counter!(target: ::std::module_path!(), level: $level, $name $(, $label_key $(=> $label_value)?)*)
     };
+    ($name:expr, $value:expr $(, $label_key:expr $(=> $label_value:expr)?)* $(,)?) => {
+        $crate::counter!(target: ::std::module_path!(), level: $crate::Level::INFO, $name $(, $label_key $(=> $label_value)?)*).increment($value);
+    };
     ($name:expr $(, $label_key:expr $(=> $label_value:expr)?)* $(,)?) => {
         $crate::counter!(target: ::std::module_path!(), level: $crate::Level::INFO, $name $(, $label_key $(=> $label_value)?)*)
     };
@@ -184,6 +187,9 @@ macro_rules! gauge {
     (level: $level:expr, $name:expr $(, $label_key:expr $(=> $label_value:expr)?)* $(,)?) => {
         $crate::gauge!(target: ::std::module_path!(), level: $level, $name $(, $label_key $(=> $label_value)?)*)
     };
+    ($name:expr, $value:expr $(, $label_key:expr $(=> $label_value:expr)?)* $(,)?) => {
+        $crate::gauge!(target: ::std::module_path!(), level: $crate::Level::INFO, $name $(, $label_key $(=> $label_value)?)*).set($value);
+    };
     ($name:expr $(, $label_key:expr $(=> $label_value:expr)?)* $(,)?) => {
         $crate::gauge!(target: ::std::module_path!(), level: $crate::Level::INFO, $name $(, $label_key $(=> $label_value)?)*)
     };
@@ -247,6 +253,9 @@ macro_rules! histogram {
     };
     (level: $level:expr, $name:expr $(, $label_key:expr $(=> $label_value:expr)?)* $(,)?) => {
         $crate::histogram!(target: ::std::module_path!(), level: $level, $name $(, $label_key $(=> $label_value)?)*)
+    };
+    ($name:expr, $value:expr $(, $label_key:expr $(=> $label_value:expr)?)* $(,)?) => {
+        $crate::histogram!(target: ::std::module_path!(), level: $crate::Level::INFO, $name $(, $label_key $(=> $label_value)?)*).record($value);
     };
     ($name:expr $(, $label_key:expr $(=> $label_value:expr)?)* $(,)?) => {
         $crate::histogram!(target: ::std::module_path!(), level: $crate::Level::INFO, $name $(, $label_key $(=> $label_value)?)*)
