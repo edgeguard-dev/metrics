@@ -2,24 +2,26 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::{PoisonError, RwLock};
 
 use indexmap::IndexMap;
-use metrics::{Counter, Gauge, Histogram, Key, KeyName, Recorder, Unit};
-use metrics_util::registry::{GenerationalAtomicStorage, Recency, Registry};
-use parking_lot::RwLock;
+use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
+use metrics_util::registry::{Recency, Registry};
+use quanta::Instant;
 
 use crate::common::Snapshot;
 use crate::distribution::{Distribution, DistributionBuilder};
 use crate::formatting::{
     key_to_parts, sanitize_metric_name, write_help_line, write_metric_line, write_type_line,
 };
+use crate::registry::GenerationalAtomicStorage;
 
 pub(crate) struct Inner {
     pub registry: Registry<Key, GenerationalAtomicStorage>,
     pub recency: Recency<Key>,
     pub distributions: RwLock<HashMap<String, IndexMap<Vec<String>, Distribution>>>,
     pub distribution_builder: DistributionBuilder,
-    pub descriptions: RwLock<HashMap<String, &'static str>>,
+    pub descriptions: RwLock<HashMap<String, SharedString>>,
     pub global_labels: IndexMap<String, String>,
 }
 
@@ -99,7 +101,7 @@ impl Inner {
                 // is not recent enough and should be/was deleted from the registry, we also need to
                 // delete it on our side as well.
                 let (name, labels) = key_to_parts(&key, Some(&self.global_labels));
-                let mut wg = self.distributions.write();
+                let mut wg = self.distributions.write().unwrap_or_else(PoisonError::into_inner);
                 let delete_by_name = if let Some(by_name) = wg.get_mut(&name) {
                     by_name.remove(&labels);
                     by_name.is_empty()
@@ -118,17 +120,18 @@ impl Inner {
 
             let (name, labels) = key_to_parts(&key, Some(&self.global_labels));
 
-            let mut wg = self.distributions.write();
+            let mut wg = self.distributions.write().unwrap_or_else(PoisonError::into_inner);
             let entry = wg
                 .entry(name.clone())
-                .or_insert_with(IndexMap::new)
+                .or_default()
                 .entry(labels)
                 .or_insert_with(|| self.distribution_builder.get_distribution(name.as_str()));
 
             histogram.get_inner().clear_with(|samples| entry.record_samples(samples));
         }
 
-        let distributions = self.distributions.read().clone();
+        let distributions =
+            self.distributions.read().unwrap_or_else(PoisonError::into_inner).clone();
 
         Snapshot { counters, gauges, distributions }
     }
@@ -195,7 +198,7 @@ impl Inner {
         let Snapshot { mut counters, mut distributions, mut gauges } = self.get_recent_metrics();
 
         let mut output = String::new();
-        let descriptions = self.descriptions.read();
+        let descriptions = self.descriptions.read().unwrap_or_else(PoisonError::into_inner);
 
         for (name, mut by_labels) in counters.drain() {
             if let Some(desc) = descriptions.get(name.as_str()) {
@@ -231,8 +234,9 @@ impl Inner {
             for (labels, distribution) in by_labels.drain(..) {
                 let (sum, count) = match distribution {
                     Distribution::Summary(summary, quantiles, sum) => {
+                        let snapshot = summary.snapshot(Instant::now());
                         for quantile in quantiles.iter() {
-                            let value = summary.quantile(quantile.value()).unwrap_or(0.0);
+                            let value = snapshot.quantile(quantile.value()).unwrap_or(0.0);
                             write_metric_line(
                                 &mut output,
                                 &name,
@@ -305,9 +309,10 @@ impl PrometheusRecorder {
         PrometheusHandle { inner: self.inner.clone() }
     }
 
-    fn add_description_if_missing(&self, key_name: &KeyName, description: &'static str) {
+    fn add_description_if_missing(&self, key_name: &KeyName, description: SharedString) {
         let sanitized = sanitize_metric_name(key_name.as_str());
-        let mut descriptions = self.inner.descriptions.write();
+        let mut descriptions =
+            self.inner.descriptions.write().unwrap_or_else(PoisonError::into_inner);
         descriptions.entry(sanitized).or_insert(description);
     }
 }
@@ -319,11 +324,11 @@ impl From<Inner> for PrometheusRecorder {
 }
 
 impl Recorder for PrometheusRecorder {
-    fn describe_counter(&self, key_name: KeyName, _unit: Option<Unit>, description: &'static str) {
+    fn describe_counter(&self, key_name: KeyName, _unit: Option<Unit>, description: SharedString) {
         self.add_description_if_missing(&key_name, description);
     }
 
-    fn describe_gauge(&self, key_name: KeyName, _unit: Option<Unit>, description: &'static str) {
+    fn describe_gauge(&self, key_name: KeyName, _unit: Option<Unit>, description: SharedString) {
         self.add_description_if_missing(&key_name, description);
     }
 
@@ -331,20 +336,20 @@ impl Recorder for PrometheusRecorder {
         &self,
         key_name: KeyName,
         _unit: Option<Unit>,
-        description: &'static str,
+        description: SharedString,
     ) {
         self.add_description_if_missing(&key_name, description);
     }
 
-    fn register_counter(&self, key: &Key) -> Counter {
+    fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
         self.inner.registry.get_or_create_counter(key, |c| c.clone().into())
     }
 
-    fn register_gauge(&self, key: &Key) -> Gauge {
+    fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
         self.inner.registry.get_or_create_gauge(key, |c| c.clone().into())
     }
 
-    fn register_histogram(&self, key: &Key) -> Histogram {
+    fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
         self.inner.registry.get_or_create_histogram(key, |c| c.clone().into())
     }
 }

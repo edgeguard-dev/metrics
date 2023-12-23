@@ -6,12 +6,15 @@ use crate::cow::Cow;
 
 /// An allocation-optimized string.
 ///
-/// We specify `SharedString` to attempt to get the best of both worlds: flexibility to provide a
-/// static or dynamic (owned) string, while retaining the performance benefits of being able to
-/// take ownership of owned strings and borrows of completely static strings.
+/// `SharedString` uses a custom copy-on-write implementation that is optimized for metric keys,
+/// providing ergonomic sharing of single instances, or slices, of strings and labels. This
+/// copy-on-write implementation is optimized to allow for constant-time construction (using static
+/// values), as well as accepting owned values and values shared through [`Arc<T>`](std::sync::Arc).
 ///
-/// `SharedString` can be converted to from either `&'static str` or `String`, with a method,
-/// `const_str`, from constructing `SharedString` from `&'static str` in a `const` fashion.
+/// End users generally will not need to interact with this type directly, as the top-level macros
+/// (`counter!`, etc), as well as the various conversion implementations
+/// ([`From<T>`](std::convert::From)), generally allow users to pass whichever variant of a value
+/// (static, owned, shared) is best for them.
 pub type SharedString = Cow<'static, str>;
 
 /// Key-specific hashing algorithm.
@@ -121,7 +124,7 @@ pub enum Unit {
 
 impl Unit {
     /// Gets the string form of this `Unit`.
-    pub fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Unit::Count => "count",
             Unit::Percent => "percent",
@@ -149,7 +152,7 @@ impl Unit {
     /// it would be `ns`.
     ///
     /// Not all units have a meaningful display label and so some may be empty.
-    pub fn as_canonical_label(&self) -> &str {
+    pub fn as_canonical_label(&self) -> &'static str {
         match self {
             Unit::Count => "",
             Unit::Percent => "%",

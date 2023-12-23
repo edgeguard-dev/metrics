@@ -1,11 +1,14 @@
 //! High-performance metrics storage.
 
 mod storage;
-use std::{hash::BuildHasherDefault, iter::repeat};
+use std::{
+    hash::BuildHasherDefault,
+    iter::repeat,
+    sync::{PoisonError, RwLock},
+};
 
 use hashbrown::{hash_map::RawEntryMut, HashMap};
 use metrics::{Key, KeyHasher};
-use parking_lot::RwLock;
 pub use storage::{AtomicStorage, Storage};
 
 #[cfg(feature = "recency")]
@@ -29,17 +32,14 @@ type RegistryHashMap<K, V> = HashMap<K, V, BuildHasherDefault<RegistryHasher>>;
 /// ## Using `Registry` as the basis of an exporter
 ///
 /// As a reusable building blocking for building exporter implementations, users should look at
-/// [`Key`] and [`AtomicStorage`][crate::registry::AtomicStorage] to use for their key and storage,
-/// respectively.
+/// [`Key`] and [`AtomicStorage`] to use for their key and storage, respectively.
 ///
 /// These two implementations provide behavior that is suitable for most exporters, providing
 /// seamless integration with the existing key type used by the core
 /// [`Recorder`][metrics::Recorder] trait, as well as atomic storage for metrics.
 ///
-/// In some cases, users may prefer
-/// [`GenerationalAtomicStorage`][crate::registry::GenerationalAtomicStorage] when know if a metric
-/// has been touched, even if its value has not changed since the last time it was observed, is
-/// necessary.
+/// In some cases, users may prefer [`GenerationalAtomicStorage`] when know if a metric has been
+/// touched, even if its value has not changed since the last time it was observed, is necessary.
 ///
 /// ## Performance
 ///
@@ -143,13 +143,13 @@ where
     /// does not ensure that callers will see the registry as entirely empty at any given point.
     pub fn clear(&self) {
         for shard in &self.counters {
-            shard.write().clear();
+            shard.write().unwrap_or_else(PoisonError::into_inner).clear();
         }
         for shard in &self.gauges {
-            shard.write().clear();
+            shard.write().unwrap_or_else(PoisonError::into_inner).clear();
         }
         for shard in &self.histograms {
-            shard.write().clear();
+            shard.write().unwrap_or_else(PoisonError::into_inner).clear();
         }
     }
 
@@ -164,13 +164,13 @@ where
         let (hash, shard) = self.get_hash_and_shard_for_counter(key);
 
         // Try and get the handle if it exists, running our operation if we succeed.
-        let shard_read = shard.read();
+        let shard_read = shard.read().unwrap_or_else(PoisonError::into_inner);
         if let Some((_, v)) = shard_read.raw_entry().from_key_hashed_nocheck(hash, key) {
             op(v)
         } else {
             // Switch to write guard and insert the handle first.
             drop(shard_read);
-            let mut shard_write = shard.write();
+            let mut shard_write = shard.write().unwrap_or_else(PoisonError::into_inner);
             let v = if let Some((_, v)) = shard_write.raw_entry().from_key_hashed_nocheck(hash, key)
             {
                 v
@@ -198,13 +198,13 @@ where
         let (hash, shard) = self.get_hash_and_shard_for_gauge(key);
 
         // Try and get the handle if it exists, running our operation if we succeed.
-        let shard_read = shard.read();
+        let shard_read = shard.read().unwrap_or_else(PoisonError::into_inner);
         if let Some((_, v)) = shard_read.raw_entry().from_key_hashed_nocheck(hash, key) {
             op(v)
         } else {
             // Switch to write guard and insert the handle first.
             drop(shard_read);
-            let mut shard_write = shard.write();
+            let mut shard_write = shard.write().unwrap_or_else(PoisonError::into_inner);
             let v = if let Some((_, v)) = shard_write.raw_entry().from_key_hashed_nocheck(hash, key)
             {
                 v
@@ -232,13 +232,13 @@ where
         let (hash, shard) = self.get_hash_and_shard_for_histogram(key);
 
         // Try and get the handle if it exists, running our operation if we succeed.
-        let shard_read = shard.read();
+        let shard_read = shard.read().unwrap_or_else(PoisonError::into_inner);
         if let Some((_, v)) = shard_read.raw_entry().from_key_hashed_nocheck(hash, key) {
             op(v)
         } else {
             // Switch to write guard and insert the handle first.
             drop(shard_read);
-            let mut shard_write = shard.write();
+            let mut shard_write = shard.write().unwrap_or_else(PoisonError::into_inner);
             let v = if let Some((_, v)) = shard_write.raw_entry().from_key_hashed_nocheck(hash, key)
             {
                 v
@@ -260,7 +260,7 @@ where
     /// Returns `true` if the counter existed and was removed, `false` otherwise.
     pub fn delete_counter(&self, key: &K) -> bool {
         let (hash, shard) = self.get_hash_and_shard_for_counter(key);
-        let mut shard_write = shard.write();
+        let mut shard_write = shard.write().unwrap_or_else(PoisonError::into_inner);
         let entry = shard_write.raw_entry_mut().from_key_hashed_nocheck(hash, key);
         if let RawEntryMut::Occupied(entry) = entry {
             let _ = entry.remove_entry();
@@ -275,7 +275,7 @@ where
     /// Returns `true` if the gauge existed and was removed, `false` otherwise.
     pub fn delete_gauge(&self, key: &K) -> bool {
         let (hash, shard) = self.get_hash_and_shard_for_gauge(key);
-        let mut shard_write = shard.write();
+        let mut shard_write = shard.write().unwrap_or_else(PoisonError::into_inner);
         let entry = shard_write.raw_entry_mut().from_key_hashed_nocheck(hash, key);
         if let RawEntryMut::Occupied(entry) = entry {
             let _ = entry.remove_entry();
@@ -290,7 +290,7 @@ where
     /// Returns `true` if the histogram existed and was removed, `false` otherwise.
     pub fn delete_histogram(&self, key: &K) -> bool {
         let (hash, shard) = self.get_hash_and_shard_for_histogram(key);
-        let mut shard_write = shard.write();
+        let mut shard_write = shard.write().unwrap_or_else(PoisonError::into_inner);
         let entry = shard_write.raw_entry_mut().from_key_hashed_nocheck(hash, key);
         if let RawEntryMut::Occupied(entry) = entry {
             let _ = entry.remove_entry();
@@ -312,7 +312,7 @@ where
         F: FnMut(&K, &S::Counter),
     {
         for subshard in self.counters.iter() {
-            let shard_read = subshard.read();
+            let shard_read = subshard.read().unwrap_or_else(PoisonError::into_inner);
             for (key, counter) in shard_read.iter() {
                 collect(key, counter);
             }
@@ -331,7 +331,7 @@ where
         F: FnMut(&K, &S::Gauge),
     {
         for subshard in self.gauges.iter() {
-            let shard_read = subshard.read();
+            let shard_read = subshard.read().unwrap_or_else(PoisonError::into_inner);
             for (key, gauge) in shard_read.iter() {
                 collect(key, gauge);
             }
@@ -350,7 +350,7 @@ where
         F: FnMut(&K, &S::Histogram),
     {
         for subshard in self.histograms.iter() {
-            let shard_read = subshard.read();
+            let shard_read = subshard.read().unwrap_or_else(PoisonError::into_inner);
             for (key, histogram) in shard_read.iter() {
                 collect(key, histogram);
             }
@@ -393,8 +393,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use atomic_shim::AtomicU64;
-    use metrics::{CounterFn, Key};
+    use metrics::{atomics::AtomicU64, CounterFn, Key};
 
     use super::Registry;
     use std::sync::{atomic::Ordering, Arc};

@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - ReleaseDate
 
+### Fixed
+
+- Fixed the `Debug` implementation for `bucket::Block<T>` which represented both an unsafe and
+  logically incorrect usage of `crossbeam-epoch.`
+
+## [0.15.1] - 2023-07-02
+
+### Added
+
+- Added a new helper type, `RecoverableRecorder`, that allows installing a recorder and then
+  recovering it later.
+
+### Changed
+
+- Update `aho-corasick` to `1.0`.
+- Pinned `hashbrown` to `0.13.1` to avoid MSRV bump.
+
+## [0.15.0] - 2023-04-16
+
+### Changed
+
+- Bump MSRV to 1.61.0.
+- Switch to `metrics`-exposed version of `AtomicU64`.
+
+## [0.14.0] - 2022-07-20
+
+### Changed
+
+- Updated `sketches-ddsketch` to `0.2.0`.
+- Switched to using `portable_atomic` for 64-bit atomics on more architectures. (#313)
+
+## [0.13.0] - 2022-05-30
+
+### Fixed
+
+- In `Summary`, some quantiles were previously mapped to an incorrect rank at low sample counts, leading to large swings
+  in estimated values. ([#304](https://github.com/metrics-rs/metrics/pull/304))
+
+### Changed
+
+- Bumped the dependency on `metrics` to deal with a public API change.
+
+## [0.12.1] - 2022-05-02
+
+### Added
+
+- A new per-thread mode for `DebuggingRecorder` that allows recording metrics on a per-thread basis to better supporting
+  the testing of metrics in user applications where many tests are concurrently emitting metrics.
+
 ## [0.12.0] - 2022-03-10
 
 ### Added

@@ -7,6 +7,7 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(any(feature = "http-listener", feature = "push-gateway"))]
 use std::pin::Pin;
+use std::sync::RwLock;
 #[cfg(any(feature = "http-listener", feature = "push-gateway"))]
 use std::thread;
 use std::time::Duration;
@@ -25,13 +26,15 @@ use hyper::{
 use hyper::{
     body::{aggregate, Buf},
     client::Client,
+    http::HeaderValue,
     Method, Request, Uri,
 };
+#[cfg(feature = "push-gateway")]
+use hyper_tls::HttpsConnector;
 
 use indexmap::IndexMap;
 #[cfg(feature = "http-listener")]
 use ipnet::IpNet;
-use parking_lot::RwLock;
 use quanta::Clock;
 #[cfg(any(feature = "http-listener", feature = "push-gateway"))]
 use tokio::runtime;
@@ -47,6 +50,7 @@ use metrics_util::{
 use crate::common::Matcher;
 use crate::distribution::DistributionBuilder;
 use crate::recorder::{Inner, PrometheusRecorder};
+use crate::registry::AtomicStorage;
 use crate::{common::BuildError, PrometheusHandle};
 
 #[cfg(any(feature = "http-listener", feature = "push-gateway"))]
@@ -61,7 +65,12 @@ enum ExporterConfig {
     // Run a push gateway task sending to the given `endpoint` after `interval` time has elapsed,
     // infinitely.
     #[cfg(feature = "push-gateway")]
-    PushGateway { endpoint: Uri, interval: Duration },
+    PushGateway {
+        endpoint: Uri,
+        interval: Duration,
+        username: Option<String>,
+        password: Option<String>,
+    },
 
     #[allow(dead_code)]
     Unconfigured,
@@ -156,6 +165,8 @@ impl PrometheusBuilder {
         mut self,
         endpoint: T,
         interval: Duration,
+        username: Option<String>,
+        password: Option<String>,
     ) -> Result<Self, BuildError>
     where
         T: AsRef<str>,
@@ -164,6 +175,8 @@ impl PrometheusBuilder {
             endpoint: Uri::try_from(endpoint.as_ref())
                 .map_err(|e| BuildError::InvalidPushGatewayEndpoint(e.to_string()))?,
             interval,
+            username,
+            password,
         };
 
         Ok(self)
@@ -391,6 +404,7 @@ impl PrometheusBuilder {
     ///
     /// If there is an error while building the recorder and exporter, an error variant will be
     /// returned describing the error.
+    #[warn(clippy::too_many_lines)]
     #[cfg(any(feature = "http-listener", feature = "push-gateway"))]
     #[cfg_attr(docsrs, doc(cfg(any(feature = "http-listener", feature = "push-gateway"))))]
     #[cfg_attr(not(feature = "http-listener"), allow(unused_mut))]
@@ -447,16 +461,23 @@ impl PrometheusBuilder {
             }
 
             #[cfg(feature = "push-gateway")]
-            ExporterConfig::PushGateway { endpoint, interval } => {
+            ExporterConfig::PushGateway { endpoint, interval, username, password } => {
                 let exporter = async move {
-                    let client = Client::new();
+                    let https = HttpsConnector::new();
+                    let client = Client::builder().build::<_, hyper::Body>(https);
+                    let auth = username.as_ref().map(|name| basic_auth(name, password.as_deref()));
 
                     loop {
                         // Sleep for `interval` amount of time, and then do a push.
                         tokio::time::sleep(interval).await;
 
+                        let mut builder = Request::builder();
+                        if let Some(auth) = &auth {
+                            builder = builder.header("authorization", auth.clone());
+                        }
+
                         let output = handle.render();
-                        let result = Request::builder()
+                        let result = builder
                             .method(Method::PUT)
                             .uri(endpoint.clone())
                             .body(Body::from(output));
@@ -479,9 +500,9 @@ impl PrometheusBuilder {
                                     let body = body
                                         .map_err(|_| ())
                                         .map(|mut b| b.copy_to_bytes(b.remaining()))
-                                        .map(|b| (&b[..]).to_vec())
+                                        .map(|b| b[..].to_vec())
                                         .and_then(|s| String::from_utf8(s).map_err(|_| ()))
-                                        .unwrap_or_else(|_| {
+                                        .unwrap_or_else(|()| {
                                             String::from("<failed to read response body>")
                                         });
                                     error!(
@@ -508,7 +529,7 @@ impl PrometheusBuilder {
 
     pub(crate) fn build_with_clock(self, clock: Clock) -> PrometheusRecorder {
         let inner = Inner {
-            registry: Registry::new(GenerationalStorage::atomic()),
+            registry: Registry::new(GenerationalStorage::new(AtomicStorage)),
             recency: Recency::new(clock, self.recency_mask, self.idle_timeout),
             distributions: RwLock::new(HashMap::new()),
             distribution_builder: DistributionBuilder::new(
@@ -530,6 +551,25 @@ impl Default for PrometheusBuilder {
     }
 }
 
+#[cfg(feature = "push-gateway")]
+fn basic_auth(username: &str, password: Option<&str>) -> HeaderValue {
+    use base64::prelude::BASE64_STANDARD;
+    use base64::write::EncoderWriter;
+    use std::io::Write;
+
+    let mut buf = b"Basic ".to_vec();
+    {
+        let mut encoder = EncoderWriter::new(&mut buf, &BASE64_STANDARD);
+        let _ = write!(encoder, "{username}:");
+        if let Some(password) = password {
+            let _ = write!(encoder, "{password}");
+        }
+    }
+    let mut header = HeaderValue::from_bytes(&buf).expect("base64 is always valid HeaderValue");
+    header.set_sensitive(true);
+    header
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -541,12 +581,16 @@ mod tests {
 
     use super::{Matcher, PrometheusBuilder};
 
+    static METADATA: metrics::Metadata =
+        metrics::Metadata::new(module_path!(), metrics::Level::INFO, Some(module_path!()));
+
     #[test]
     fn test_render() {
-        let recorder = PrometheusBuilder::new().build_recorder();
+        let recorder =
+            PrometheusBuilder::new().set_quantiles(&[0.0, 1.0]).unwrap().build_recorder();
 
         let key = Key::from_name("basic_counter");
-        let counter1 = recorder.register_counter(&key);
+        let counter1 = recorder.register_counter(&key, &METADATA);
         counter1.increment(42);
 
         let handle = recorder.handle();
@@ -557,7 +601,7 @@ mod tests {
 
         let labels = vec![Label::new("wutang", "forever")];
         let key = Key::from_parts("basic_gauge", labels);
-        let gauge1 = recorder.register_gauge(&key);
+        let gauge1 = recorder.register_gauge(&key, &METADATA);
         gauge1.set(-3.14);
         let rendered = handle.render();
         let expected_gauge = format!(
@@ -568,18 +612,13 @@ mod tests {
         assert_eq!(rendered, expected_gauge);
 
         let key = Key::from_name("basic_histogram");
-        let histogram1 = recorder.register_histogram(&key);
+        let histogram1 = recorder.register_histogram(&key, &METADATA);
         histogram1.record(12.0);
         let rendered = handle.render();
 
         let histogram_data = concat!(
             "# TYPE basic_histogram summary\n",
             "basic_histogram{quantile=\"0\"} 12\n",
-            "basic_histogram{quantile=\"0.5\"} 12\n",
-            "basic_histogram{quantile=\"0.9\"} 12\n",
-            "basic_histogram{quantile=\"0.95\"} 12\n",
-            "basic_histogram{quantile=\"0.99\"} 12\n",
-            "basic_histogram{quantile=\"0.999\"} 12\n",
             "basic_histogram{quantile=\"1\"} 12\n",
             "basic_histogram_sum 12\n",
             "basic_histogram_count 1\n",
@@ -615,19 +654,19 @@ mod tests {
             .build_recorder();
 
         let full_key = Key::from_name("metrics.testing_foo");
-        let full_key_histo = recorder.register_histogram(&full_key);
+        let full_key_histo = recorder.register_histogram(&full_key, &METADATA);
         full_key_histo.record(FULL_VALUES[0]);
 
         let prefix_key = Key::from_name("metrics.testing_bar");
-        let prefix_key_histo = recorder.register_histogram(&prefix_key);
+        let prefix_key_histo = recorder.register_histogram(&prefix_key, &METADATA);
         prefix_key_histo.record(PREFIX_VALUES[1]);
 
         let suffix_key = Key::from_name("metrics_testin_foo");
-        let suffix_key_histo = recorder.register_histogram(&suffix_key);
+        let suffix_key_histo = recorder.register_histogram(&suffix_key, &METADATA);
         suffix_key_histo.record(SUFFIX_VALUES[2]);
 
         let default_key = Key::from_name("metrics.wee");
-        let default_key_histo = recorder.register_histogram(&default_key);
+        let default_key_histo = recorder.register_histogram(&default_key, &METADATA);
         default_key_histo.record(DEFAULT_VALUES[2] + 1.0);
 
         let full_data = concat!(
@@ -685,18 +724,20 @@ mod tests {
 
         let recorder = PrometheusBuilder::new()
             .idle_timeout(MetricKindMask::ALL, Some(Duration::from_secs(10)))
+            .set_quantiles(&[0.0, 1.0])
+            .unwrap()
             .build_with_clock(clock);
 
         let key = Key::from_name("basic_counter");
-        let counter1 = recorder.register_counter(&key);
+        let counter1 = recorder.register_counter(&key, &METADATA);
         counter1.increment(42);
 
         let key = Key::from_name("basic_gauge");
-        let gauge1 = recorder.register_gauge(&key);
+        let gauge1 = recorder.register_gauge(&key, &METADATA);
         gauge1.set(-3.14);
 
         let key = Key::from_name("basic_histogram");
-        let histo1 = recorder.register_histogram(&key);
+        let histo1 = recorder.register_histogram(&key, &METADATA);
         histo1.record(1.0);
 
         let handle = recorder.handle();
@@ -708,11 +749,6 @@ mod tests {
             "basic_gauge -3.14\n\n",
             "# TYPE basic_histogram summary\n",
             "basic_histogram{quantile=\"0\"} 1\n",
-            "basic_histogram{quantile=\"0.5\"} 1\n",
-            "basic_histogram{quantile=\"0.9\"} 1\n",
-            "basic_histogram{quantile=\"0.95\"} 1\n",
-            "basic_histogram{quantile=\"0.99\"} 1\n",
-            "basic_histogram{quantile=\"0.999\"} 1\n",
             "basic_histogram{quantile=\"1\"} 1\n",
             "basic_histogram_sum 1\n",
             "basic_histogram_count 1\n\n",
@@ -738,18 +774,20 @@ mod tests {
                 MetricKindMask::COUNTER | MetricKindMask::HISTOGRAM,
                 Some(Duration::from_secs(10)),
             )
+            .set_quantiles(&[0.0, 1.0])
+            .unwrap()
             .build_with_clock(clock);
 
         let key = Key::from_name("basic_counter");
-        let counter1 = recorder.register_counter(&key);
+        let counter1 = recorder.register_counter(&key, &METADATA);
         counter1.increment(42);
 
         let key = Key::from_name("basic_gauge");
-        let gauge1 = recorder.register_gauge(&key);
+        let gauge1 = recorder.register_gauge(&key, &METADATA);
         gauge1.set(-3.14);
 
         let key = Key::from_name("basic_histogram");
-        let histo1 = recorder.register_histogram(&key);
+        let histo1 = recorder.register_histogram(&key, &METADATA);
         histo1.record(1.0);
 
         let handle = recorder.handle();
@@ -761,11 +799,6 @@ mod tests {
             "basic_gauge -3.14\n\n",
             "# TYPE basic_histogram summary\n",
             "basic_histogram{quantile=\"0\"} 1\n",
-            "basic_histogram{quantile=\"0.5\"} 1\n",
-            "basic_histogram{quantile=\"0.9\"} 1\n",
-            "basic_histogram{quantile=\"0.95\"} 1\n",
-            "basic_histogram{quantile=\"0.99\"} 1\n",
-            "basic_histogram{quantile=\"0.999\"} 1\n",
             "basic_histogram{quantile=\"1\"} 1\n",
             "basic_histogram_sum 1\n",
             "basic_histogram_count 1\n\n",
@@ -790,18 +823,20 @@ mod tests {
 
         let recorder = PrometheusBuilder::new()
             .idle_timeout(MetricKindMask::ALL, Some(Duration::from_secs(10)))
+            .set_quantiles(&[0.0, 1.0])
+            .unwrap()
             .build_with_clock(clock);
 
         let key = Key::from_name("basic_counter");
-        let counter1 = recorder.register_counter(&key);
+        let counter1 = recorder.register_counter(&key, &METADATA);
         counter1.increment(42);
 
         let key = Key::from_name("basic_gauge");
-        let gauge1 = recorder.register_gauge(&key);
+        let gauge1 = recorder.register_gauge(&key, &METADATA);
         gauge1.set(-3.14);
 
         let key = Key::from_name("basic_histogram");
-        let histo1 = recorder.register_histogram(&key);
+        let histo1 = recorder.register_histogram(&key, &METADATA);
         histo1.record(1.0);
 
         let handle = recorder.handle();
@@ -813,11 +848,6 @@ mod tests {
             "basic_gauge -3.14\n\n",
             "# TYPE basic_histogram summary\n",
             "basic_histogram{quantile=\"0\"} 1\n",
-            "basic_histogram{quantile=\"0.5\"} 1\n",
-            "basic_histogram{quantile=\"0.9\"} 1\n",
-            "basic_histogram{quantile=\"0.95\"} 1\n",
-            "basic_histogram{quantile=\"0.99\"} 1\n",
-            "basic_histogram{quantile=\"0.999\"} 1\n",
             "basic_histogram{quantile=\"1\"} 1\n",
             "basic_histogram_sum 1\n",
             "basic_histogram_count 1\n\n",
@@ -830,7 +860,7 @@ mod tests {
         assert_eq!(rendered, expected);
 
         let key = Key::from_parts("basic_histogram", vec![Label::new("type", "special")]);
-        let histo2 = recorder.register_histogram(&key);
+        let histo2 = recorder.register_histogram(&key, &METADATA);
         histo2.record(2.0);
 
         let expected_second = concat!(
@@ -840,20 +870,10 @@ mod tests {
             "basic_gauge -3.14\n\n",
             "# TYPE basic_histogram summary\n",
             "basic_histogram{quantile=\"0\"} 1\n",
-            "basic_histogram{quantile=\"0.5\"} 1\n",
-            "basic_histogram{quantile=\"0.9\"} 1\n",
-            "basic_histogram{quantile=\"0.95\"} 1\n",
-            "basic_histogram{quantile=\"0.99\"} 1\n",
-            "basic_histogram{quantile=\"0.999\"} 1\n",
             "basic_histogram{quantile=\"1\"} 1\n",
             "basic_histogram_sum 1\n",
             "basic_histogram_count 1\n",
             "basic_histogram{type=\"special\",quantile=\"0\"} 2\n",
-            "basic_histogram{type=\"special\",quantile=\"0.5\"} 2\n",
-            "basic_histogram{type=\"special\",quantile=\"0.9\"} 2\n",
-            "basic_histogram{type=\"special\",quantile=\"0.95\"} 2\n",
-            "basic_histogram{type=\"special\",quantile=\"0.99\"} 2\n",
-            "basic_histogram{type=\"special\",quantile=\"0.999\"} 2\n",
             "basic_histogram{type=\"special\",quantile=\"1\"} 2\n",
             "basic_histogram_sum{type=\"special\"} 2\n",
             "basic_histogram_count{type=\"special\"} 1\n\n",
@@ -864,11 +884,6 @@ mod tests {
         let expected_after = concat!(
             "# TYPE basic_histogram summary\n",
             "basic_histogram{type=\"special\",quantile=\"0\"} 2\n",
-            "basic_histogram{type=\"special\",quantile=\"0.5\"} 2\n",
-            "basic_histogram{type=\"special\",quantile=\"0.9\"} 2\n",
-            "basic_histogram{type=\"special\",quantile=\"0.95\"} 2\n",
-            "basic_histogram{type=\"special\",quantile=\"0.99\"} 2\n",
-            "basic_histogram{type=\"special\",quantile=\"0.999\"} 2\n",
             "basic_histogram{type=\"special\",quantile=\"1\"} 2\n",
             "basic_histogram_sum{type=\"special\"} 2\n",
             "basic_histogram_count{type=\"special\"} 1\n\n",
@@ -888,11 +903,11 @@ mod tests {
             .build_with_clock(clock);
 
         let key = Key::from_name("basic_counter");
-        let counter1 = recorder.register_counter(&key);
+        let counter1 = recorder.register_counter(&key, &METADATA);
         counter1.increment(42);
 
         let key = Key::from_name("basic_gauge");
-        let gauge1 = recorder.register_gauge(&key);
+        let gauge1 = recorder.register_gauge(&key, &METADATA);
         gauge1.set(-3.14);
 
         let handle = recorder.handle();
@@ -937,7 +952,7 @@ mod tests {
             .build_with_clock(clock);
 
         let key = Key::from_name("basic_counter");
-        let counter1 = recorder.register_counter(&key);
+        let counter1 = recorder.register_counter(&key, &METADATA);
         counter1.increment(42);
 
         // First render, which starts tracking the counter in the recency state.
@@ -976,7 +991,7 @@ mod tests {
             .add_global_label("foo", "bar")
             .build_recorder();
         let key = Key::from_name("basic_counter");
-        let counter1 = recorder.register_counter(&key);
+        let counter1 = recorder.register_counter(&key, &METADATA);
         counter1.increment(42);
 
         let handle = recorder.handle();
@@ -992,7 +1007,7 @@ mod tests {
 
         let key =
             Key::from_name("overridden").with_extra_labels(vec![Label::new("foo", "overridden")]);
-        let counter1 = recorder.register_counter(&key);
+        let counter1 = recorder.register_counter(&key, &METADATA);
         counter1.increment(1);
 
         let handle = recorder.handle();
@@ -1009,8 +1024,8 @@ mod tests {
         let key_name = KeyName::from("yee_haw:lets go");
         let key = Key::from_name(key_name.clone())
             .with_extra_labels(vec![Label::new("øhno", "\"yeet\nies\\\"")]);
-        recorder.describe_counter(key_name, None, "\"Simplë stuff.\nRëally.\"");
-        let counter1 = recorder.register_counter(&key);
+        recorder.describe_counter(key_name, None, "\"Simplë stuff.\nRëally.\"".into());
+        let counter1 = recorder.register_counter(&key, &METADATA);
         counter1.increment(1);
 
         let handle = recorder.handle();
@@ -1018,5 +1033,41 @@ mod tests {
         let expected_counter = "# HELP yee_haw:lets_go \"Simplë stuff.\\nRëally.\"\n# TYPE yee_haw:lets_go counter\nyee_haw:lets_go{foo_=\"foo\",_hno=\"\\\"yeet\\nies\\\"\"} 1\n\n";
 
         assert_eq!(rendered, expected_counter);
+    }
+}
+
+#[cfg(all(test, feature = "push-gateway"))]
+mod push_gateway_tests {
+    use crate::builder::basic_auth;
+
+    #[test]
+    pub fn test_basic_auth() {
+        use base64::prelude::BASE64_STANDARD;
+        use base64::read::DecoderReader;
+        use std::io::Read;
+
+        const BASIC: &str = "Basic ";
+
+        // username only
+        let username = "metrics";
+        let header = basic_auth(username, None);
+
+        let reader = &header.as_ref()[BASIC.len()..];
+        let mut decoder = DecoderReader::new(reader, &BASE64_STANDARD);
+        let mut result = Vec::new();
+        decoder.read_to_end(&mut result).unwrap();
+        assert_eq!(b"metrics:", &result[..]);
+        assert!(header.is_sensitive());
+
+        // username/password
+        let password = "123!_@ABC";
+        let header = basic_auth(username, Some(password));
+
+        let reader = &header.as_ref()[BASIC.len()..];
+        let mut decoder = DecoderReader::new(reader, &BASE64_STANDARD);
+        let mut result = Vec::new();
+        decoder.read_to_end(&mut result).unwrap();
+        assert_eq!(b"metrics:123!_@ABC", &result[..]);
+        assert!(header.is_sensitive());
     }
 }

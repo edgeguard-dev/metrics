@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - ReleaseDate
 
+## [0.8.0] - 2023-04-16
+
+### Changed
+
+- Bump MSRV to 1.61.0.
+- Implemented `std::error::Error` for `Error`.
+
+## [0.7.0] - 2022-07-20
+
+### Changed
+
+- Update `metrics` to `0.20`.
+
 ## [0.6.0] - 2022-01-14
 
 ### Changed

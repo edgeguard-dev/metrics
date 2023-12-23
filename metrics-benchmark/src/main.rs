@@ -1,12 +1,12 @@
-use atomic_shim::AtomicU64;
 use getopts::Options;
 use hdrhistogram::Histogram as HdrHistogram;
 use log::{error, info};
 use metrics::{
-    gauge, histogram, increment_counter, register_counter, register_gauge, register_histogram,
-    Counter, Gauge, Histogram, Key, KeyName, Recorder, Unit,
+    counter, gauge, histogram, Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder,
+    SharedString, Unit,
 };
 use metrics_util::registry::{AtomicStorage, Registry};
+use portable_atomic::AtomicU64;
 use quanta::{Clock, Instant as QuantaInstant};
 use std::{
     env,
@@ -62,21 +62,21 @@ impl BenchmarkingRecorder {
 }
 
 impl Recorder for BenchmarkingRecorder {
-    fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: &'static str) {}
+    fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
 
-    fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: &'static str) {}
+    fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
 
-    fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: &'static str) {}
+    fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
 
-    fn register_counter(&self, key: &Key) -> Counter {
+    fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
         self.registry.get_or_create_counter(key, |c| Counter::from_arc(c.clone()))
     }
 
-    fn register_gauge(&self, key: &Key) -> Gauge {
+    fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
         self.registry.get_or_create_gauge(key, |g| Gauge::from_arc(g.clone()))
     }
 
-    fn register_histogram(&self, key: &Key) -> Histogram {
+    fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
         self.registry.get_or_create_histogram(key, |h| Histogram::from_arc(h.clone()))
     }
 }
@@ -120,9 +120,9 @@ impl Generator {
             if let Some(t0) = self.t0 {
                 let start = if loop_counter % LOOP_SAMPLE == 0 { Some(clock.now()) } else { None };
 
-                increment_counter!("ok");
-                gauge!("total", self.gauge as f64);
-                histogram!("ok", t1.sub(t0));
+                counter!("ok").increment(1);
+                gauge!("total").set(self.gauge as f64);
+                histogram!("ok").record(t1.sub(t0));
 
                 if let Some(val) = start {
                     let delta = clock.now() - val;
@@ -145,9 +145,9 @@ impl Generator {
         let clock = Clock::new();
         let mut loop_counter = 0;
 
-        let counter = register_counter!("ok");
-        let gauge = register_gauge!("total");
-        let histogram = register_histogram!("ok");
+        let counter = counter!("ok");
+        let gauge = gauge!("total");
+        let histogram = histogram!("ok");
 
         loop {
             loop_counter += 1;

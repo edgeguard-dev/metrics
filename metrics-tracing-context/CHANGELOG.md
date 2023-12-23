@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - ReleaseDate
 
+### Added
+
+- Support for dynamism using `tracing::Span::record` to add label values. ([#408](https://github.com/metrics-rs/metrics/pull/408))
+
+## [0.14.0] - 2023-04-16
+
+### Changed
+
+- Bump MSRV to 1.61.0.
+
+## [0.13.0] - 2023-01-20
+
+## [0.12.0] - 2022-07-20
+
+### Changed
+
+- Update `metrics` to `0.20`.
+
+## [0.11.0] - 2022-05-30
+
+### Added
+
+- A new label filter, `Allowlist`, to only collect labels which are present in the list. ([#288](https://github.com/metrics-rs/metrics/pull/288))
+
+### Changed
+
+- Bumped the dependency on `metrics` to deal with a public API change.
+
 ## [0.10.0] - 2022-01-14
 
 ### Changed

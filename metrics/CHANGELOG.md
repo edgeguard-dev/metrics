@@ -8,6 +8,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - ReleaseDate
 
+### Added
+
+- Support for using `Arc<T>` with `Cow<'a, T>`.
+  ([#402](https://github.com/metrics-rs/metrics/pull/402))
+
+  This will primarily allow using `Arc<str>` for metric names and labels, where previously only
+  `&'static str` or `String` were allowed. There's still work to be done to also support labels in
+  this regard.
+
+### Changed
+
+- Make `Unit` methods return `&'static str` (instead of `&str`) where possible. ([#392](https://github.com/metrics-rs/metrics/pull/393))
+
+## [0.21.1] - 2023-07-02
+
+### Added
+
+- Added a `From` implementation for `KeyName` from `Cow<'static, str>`.
+  ([#378](https://github.com/metrics-rs/metrics/pull/378))
+
+### Removed
+
+- Removed `metrics::set_recorder_racy` as it was intended to be used in `no_std` use cases, but
+  `metrics` is not currently compatible in `no_std` environments, so keeping `set_recorder_racy`
+  around was just API baggage.
+
+## [0.21.0] - 2023-04-16
+
+### Added
+
+- A new module, `atomics`, exposes the atomic integer type that `CounterFn` and `GaugeFn` are
+  implemented for. This will publicly re-export the type for usage by downstream crates. (Credit to
+  [@repi](https://github.com/repi) for the original PR (#347) that did this.)
+
+### Changed
+
+- Bump MSRV to 1.61.0.
+- `portable-atomic` is only used on 32-bit architectures.
+
+### Removed
+
+- Removed the `std-atomics` feature flag.
+
+## [0.20.1] - 2022-07-22
+
+### Changed
+
+- Bumped the dependency on `metrics-macros` to correctly use the updated versions that are necessary
+  for handling the recent `&'static str` -> `SharedString` change to `Recorder::describe_*`.
+
+  We'll also yank 0.20.0 once this is released to avoid the patch version triggering a breaking
+  change jump in transitive dependencies, and so people can't pick up a version of `metrics` that
+  doesn't actually work as it should.
+
+## [0.20.0] - 2022-07-20
+
+### Changed
+
+- Changed `Recorder::describe_*` to take `SharedString` instead of `&'static str` for descriptions. (#312)
+- Implemented `CounterFn` and `GaugeFn` for `portable_atomic::AtomicU64` (#313)
+- Moved implementations of `CounterFn` and `GaugeFn` for `std::sync::atomic::AtomicU64` behind a
+  default feature flag.
+
+## [0.19.0] - 2022-05-30
+
+### Fixed
+
+- Small typo in the documentation. ([#286](https://github.com/metrics-rs/metrics/pull/286))
+
+### Changed
+
+- Refactored the global recorder instance, namely around how it gets set and documenting the safety guarantees of
+  methods related to setting and unsetting it. ([#302](https://github.com/metrics-rs/metrics/pull/302))
+- Fixed an issue with pointer provenance in `metrics::Cow`. ([#303](https://github.com/metrics-rs/metrics/pull/303))
+
 ## [0.18.1] - 2022-03-10
 
 ### Added

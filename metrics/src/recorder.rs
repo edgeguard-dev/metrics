@@ -1,13 +1,91 @@
-use crate::{Counter, Gauge, Histogram, Key, KeyName, Unit};
-use core::fmt;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use std::fmt;
 
-static mut RECORDER: &'static dyn Recorder = &NoopRecorder;
-static STATE: AtomicUsize = AtomicUsize::new(0);
+use self::cell::RecorderOnceCell;
 
-const UNINITIALIZED: usize = 0;
-const INITIALIZING: usize = 1;
-const INITIALIZED: usize = 2;
+use crate::{Counter, Gauge, Histogram, Key, KeyName, Metadata, SharedString, Unit};
+
+mod cell {
+    use super::{Recorder, SetRecorderError};
+    use std::{
+        cell::UnsafeCell,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    /// The recorder is uninitialized.
+    const UNINITIALIZED: usize = 0;
+
+    /// The recorder is currently being initialized.
+    const INITIALIZING: usize = 1;
+
+    /// The recorder has been initialized successfully and can be read.
+    const INITIALIZED: usize = 2;
+
+    /// An specialized version of `OnceCell` for `Recorder`.
+    pub struct RecorderOnceCell {
+        recorder: UnsafeCell<Option<&'static dyn Recorder>>,
+        state: AtomicUsize,
+    }
+
+    impl RecorderOnceCell {
+        /// Creates an uninitialized `RecorderOnceCell`.
+        pub const fn new() -> Self {
+            Self { recorder: UnsafeCell::new(None), state: AtomicUsize::new(UNINITIALIZED) }
+        }
+
+        pub fn set(&self, recorder: &'static dyn Recorder) -> Result<(), SetRecorderError> {
+            // Try and transition the cell from `UNINITIALIZED` to `INITIALIZING`, which would give
+            // us exclusive access to set the recorder.
+            match self.state.compare_exchange(
+                UNINITIALIZED,
+                INITIALIZING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(UNINITIALIZED) => {
+                    unsafe {
+                        // SAFETY: Access is unique because we can only be here if we won the race
+                        // to transition from `UNINITIALIZED` to `INITIALIZING` above.
+                        self.recorder.get().write(Some(recorder));
+                    }
+
+                    // Mark the recorder as initialized, which will make it visible to readers.
+                    self.state.store(INITIALIZED, Ordering::Release);
+                    Ok(())
+                }
+                _ => Err(SetRecorderError(())),
+            }
+        }
+
+        /// Clears the currently installed recorder, allowing a new writer to override it.
+        ///
+        /// # Safety
+        ///
+        /// The caller must guarantee that no reader has read the state before we do this and then
+        /// reads the recorder after another writer has written to it after us.
+        pub unsafe fn clear(&self) {
+            // Set the state to `UNINITIALIZED` to allow the next writer to write again. This is not
+            // a problem for readers since their `&'static` refs will remain valid forever.
+            self.state.store(UNINITIALIZED, Ordering::Relaxed);
+        }
+
+        pub fn try_load(&self) -> Option<&'static dyn Recorder> {
+            if self.state.load(Ordering::Acquire) != INITIALIZED {
+                None
+            } else {
+                // SAFETY: If the state is `INITIALIZED`, then we know that the recorder has been
+                // installed and is safe to read.
+                unsafe { self.recorder.get().read() }
+            }
+        }
+    }
+
+    // SAFETY: We can only mutate through `set`, which is protected by the `state` and unsafe
+    // function where the caller has to guarantee synced-ness.
+    unsafe impl Send for RecorderOnceCell {}
+    unsafe impl Sync for RecorderOnceCell {}
+}
+
+static RECORDER: RecorderOnceCell = RecorderOnceCell::new();
 
 static SET_RECORDER_ERROR: &str =
     "attempted to set a recorder after the metrics system was already initialized";
@@ -23,7 +101,7 @@ pub trait Recorder {
     /// not a metric can be reregistered to provide a unit/description, if one was already passed
     /// or not, as well as how units/descriptions are used by the underlying recorder, is an
     /// implementation detail.
-    fn describe_counter(&self, key: KeyName, unit: Option<Unit>, description: &'static str);
+    fn describe_counter(&self, key: KeyName, unit: Option<Unit>, description: SharedString);
 
     /// Describes a gauge.
     ///
@@ -31,7 +109,7 @@ pub trait Recorder {
     /// not a metric can be reregistered to provide a unit/description, if one was already passed
     /// or not, as well as how units/descriptions are used by the underlying recorder, is an
     /// implementation detail.
-    fn describe_gauge(&self, key: KeyName, unit: Option<Unit>, description: &'static str);
+    fn describe_gauge(&self, key: KeyName, unit: Option<Unit>, description: SharedString);
 
     /// Describes a histogram.
     ///
@@ -39,16 +117,16 @@ pub trait Recorder {
     /// not a metric can be reregistered to provide a unit/description, if one was already passed
     /// or not, as well as how units/descriptions are used by the underlying recorder, is an
     /// implementation detail.
-    fn describe_histogram(&self, key: KeyName, unit: Option<Unit>, description: &'static str);
+    fn describe_histogram(&self, key: KeyName, unit: Option<Unit>, description: SharedString);
 
     /// Registers a counter.
-    fn register_counter(&self, key: &Key) -> Counter;
+    fn register_counter(&self, key: &Key, metadata: &Metadata<'_>) -> Counter;
 
     /// Registers a gauge.
-    fn register_gauge(&self, key: &Key) -> Gauge;
+    fn register_gauge(&self, key: &Key, metadata: &Metadata<'_>) -> Gauge;
 
     /// Registers a histogram.
-    fn register_histogram(&self, key: &Key) -> Histogram;
+    fn register_histogram(&self, key: &Key, metadata: &Metadata<'_>) -> Histogram;
 }
 
 /// A no-op recorder.
@@ -58,16 +136,16 @@ pub trait Recorder {
 pub struct NoopRecorder;
 
 impl Recorder for NoopRecorder {
-    fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: &'static str) {}
-    fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: &'static str) {}
-    fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: &'static str) {}
-    fn register_counter(&self, _key: &Key) -> Counter {
+    fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+    fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+    fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+    fn register_counter(&self, _key: &Key, _metadata: &Metadata<'_>) -> Counter {
         Counter::noop()
     }
-    fn register_gauge(&self, _key: &Key) -> Gauge {
+    fn register_gauge(&self, _key: &Key, _metadata: &Metadata<'_>) -> Gauge {
         Gauge::noop()
     }
-    fn register_histogram(&self, _key: &Key) -> Histogram {
+    fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
         Histogram::noop()
     }
 }
@@ -83,94 +161,38 @@ impl Recorder for NoopRecorder {
 /// # Errors
 ///
 /// An error is returned if a recorder has already been set.
-#[cfg(atomic_cas)]
 pub fn set_recorder(recorder: &'static dyn Recorder) -> Result<(), SetRecorderError> {
-    set_recorder_inner(|| recorder)
+    RECORDER.set(recorder)
 }
 
 /// Sets the global recorder to a `Box<Recorder>`.
 ///
 /// This is a simple convenience wrapper over `set_recorder`, which takes a `Box<Recorder>`
-/// rather than a `&'static Recorder`.  See the document for [`set_recorder`] for more
+/// rather than a `&'static Recorder`.  See the documentation for [`set_recorder`] for more
 /// details.
-///
-/// Requires the `std` feature.
 ///
 /// # Errors
 ///
 /// An error is returned if a recorder has already been set.
-#[cfg(atomic_cas)]
 pub fn set_boxed_recorder(recorder: Box<dyn Recorder>) -> Result<(), SetRecorderError> {
-    set_recorder_inner(|| unsafe { &*Box::into_raw(recorder) })
-}
-
-#[cfg(atomic_cas)]
-fn set_recorder_inner<F>(make_recorder: F) -> Result<(), SetRecorderError>
-where
-    F: FnOnce() -> &'static dyn Recorder,
-{
-    unsafe {
-        match STATE.compare_exchange(
-            UNINITIALIZED,
-            INITIALIZING,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(UNINITIALIZED) => {
-                RECORDER = make_recorder();
-                STATE.store(INITIALIZED, Ordering::SeqCst);
-                Ok(())
-            }
-            Err(INITIALIZING) => {
-                while STATE.load(Ordering::SeqCst) == INITIALIZING {}
-                Err(SetRecorderError(()))
-            }
-            _ => Err(SetRecorderError(())),
-        }
-    }
-}
-
-/// A thread-unsafe version of [`set_recorder`].
-///
-/// This function is available on all platforms, even those that do not have support for atomics
-/// that are needed by [`set_recorder`].
-///
-/// In almost all cases, [`set_recorder`] should be preferred.
-///
-/// # Safety
-///
-/// This function is only safe to call when no other metrics initialization function is called
-/// while this function still executes.
-///
-/// This can be upheld by (for example) making sure that **there are no other threads**, and (on
-/// embedded) that **interrupts are disabled**.
-///
-/// It is safe to use other metrics functions while this function runs (including all metrics
-/// macros).
-pub unsafe fn set_recorder_racy(recorder: &'static dyn Recorder) -> Result<(), SetRecorderError> {
-    match STATE.load(Ordering::SeqCst) {
-        UNINITIALIZED => {
-            RECORDER = recorder;
-            STATE.store(INITIALIZED, Ordering::SeqCst);
-            Ok(())
-        }
-        INITIALIZING => {
-            // This is just plain UB, since we were racing another initialization function
-            unreachable!("set_recorder_racy must not be used with other initialization functions")
-        }
-        _ => Err(SetRecorderError(())),
-    }
+    RECORDER.set(Box::leak(recorder))
 }
 
 /// Clears the currently configured recorder.
 ///
-/// As we give out a reference to the recorder with a static lifetime, we cannot safely reclaim
-/// and drop the installed recorder when clearing.  Thus, any existing recorder will stay leaked.
+/// This will leak the currently installed recorder, as we cannot safely drop it due to it being
+/// provided via a reference with a `'static` lifetime.
 ///
 /// This method is typically only useful for testing or benchmarking.
+///
+/// # Safety
+///
+/// The caller must ensure that this method is not being called while other threads are either
+/// loading a reference to the global recorder, or attempting to initialize the global recorder, as
+/// it can cause a data race.
 #[doc(hidden)]
-pub fn clear_recorder() {
-    STATE.store(UNINITIALIZED, Ordering::SeqCst);
+pub unsafe fn clear_recorder() {
+    RECORDER.clear();
 }
 
 /// The type returned by [`set_recorder`] if [`set_recorder`] has already been called.
@@ -183,7 +205,6 @@ impl fmt::Display for SetRecorderError {
     }
 }
 
-// The Error trait is not available in libcore
 impl std::error::Error for SetRecorderError {
     fn description(&self) -> &str {
         SET_RECORDER_ERROR
@@ -202,11 +223,5 @@ pub fn recorder() -> &'static dyn Recorder {
 ///
 /// If a recorder has not been set, returns `None`.
 pub fn try_recorder() -> Option<&'static dyn Recorder> {
-    unsafe {
-        if STATE.load(Ordering::Relaxed) != INITIALIZED {
-            None
-        } else {
-            Some(RECORDER)
-        }
-    }
+    RECORDER.try_load()
 }
