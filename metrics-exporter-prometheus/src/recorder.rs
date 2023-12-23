@@ -290,6 +290,14 @@ impl Inner {
 
         output
     }
+
+    pub fn clear(&self) {
+        self.registry.clear();
+        let lock = self.distributions.write();
+        if let Ok(mut lock) = lock {
+            lock.clear();
+        }
+    }
 }
 
 /// A Prometheus recorder.
@@ -376,5 +384,10 @@ impl PrometheusHandle {
     /// Returns the metrics in newline delimited format.
     pub fn render_nd_json(&self) -> Result<Vec<String>, Box<dyn Error>> {
         self.inner.render_nd_json()
+    }
+
+    /// Clear all the recorded metrics.
+    pub fn clear(&self) {
+        self.inner.clear();
     }
 }
