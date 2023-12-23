@@ -158,6 +158,7 @@ impl Inner {
             for (labels, distribution) in by_labels.drain(..) {
                 let (sum, count) = match distribution {
                     Distribution::Summary(summary, quantiles, sum) => {
+                        let summary = summary.snapshot(Instant::now());
                         for quantile in quantiles.iter() {
                             let value = summary.quantile(quantile.value()).unwrap_or(0.0);
                             let additional = Some(format!("quantile={}", quantile.value()));
