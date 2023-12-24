@@ -1,15 +1,10 @@
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 
 use crate::IntoF64;
 
 /// A counter handler.
 pub trait CounterFn {
     /// Increments the counter by the given amount.
-    ///
-    /// Returns the previous value.
     fn increment(&self, value: u64);
 
     /// Sets the counter to at least the given amount.
@@ -22,26 +17,18 @@ pub trait CounterFn {
     ///
     /// This method must cope with those cases.  An example of doing so atomically can be found in
     /// `AtomicCounter`.
-    ///
-    /// Returns the previous value.
     fn absolute(&self, value: u64);
 }
 
 /// A gauge handler.
 pub trait GaugeFn {
     /// Increments the gauge by the given amount.
-    ///
-    /// Returns the previous value.
     fn increment(&self, value: f64);
 
     /// Decrements the gauge by the given amount.
-    ///
-    /// Returns the previous value.
     fn decrement(&self, value: f64);
 
     /// Sets the gauge to the given amount.
-    ///
-    /// Returns the previous value.
     fn set(&self, value: f64);
 }
 
@@ -153,50 +140,6 @@ impl Histogram {
         if let Some(ref inner) = self.inner {
             inner.record(value.into_f64())
         }
-    }
-}
-
-impl CounterFn for AtomicU64 {
-    fn increment(&self, value: u64) {
-        let _ = self.fetch_add(value, Ordering::Release);
-    }
-
-    fn absolute(&self, value: u64) {
-        let _ = self.fetch_max(value, Ordering::AcqRel);
-    }
-}
-
-impl GaugeFn for AtomicU64 {
-    fn increment(&self, value: f64) {
-        loop {
-            let result = self.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |curr| {
-                let input = f64::from_bits(curr);
-                let output = input + value;
-                Some(output.to_bits())
-            });
-
-            if result.is_ok() {
-                break;
-            }
-        }
-    }
-
-    fn decrement(&self, value: f64) {
-        loop {
-            let result = self.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |curr| {
-                let input = f64::from_bits(curr);
-                let output = input - value;
-                Some(output.to_bits())
-            });
-
-            if result.is_ok() {
-                break;
-            }
-        }
-    }
-
-    fn set(&self, value: f64) {
-        let _ = self.swap(value.to_bits(), Ordering::AcqRel);
     }
 }
 

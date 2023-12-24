@@ -23,12 +23,11 @@
 //! observed, to build a complete picture that allows deciding if a given metric has gone "idle" or
 //! not, and thus whether it should actually be deleted.
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use std::{collections::HashMap, ops::DerefMut};
 
 use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn};
-use parking_lot::Mutex;
 use quanta::{Clock, Instant};
 
 use crate::Hashable;
@@ -248,12 +247,15 @@ where
     /// method will return `true` and will update the last update time internally.  If the given key
     /// has not been updated recently enough, the key will be removed from the given registry if the
     /// given generation also matches.
-    pub fn should_store_counter(
+    pub fn should_store_counter<S>(
         &self,
         key: &K,
         gen: Generation,
-        registry: &Registry<K, GenerationalAtomicStorage>,
-    ) -> bool {
+        registry: &Registry<K, S>,
+    ) -> bool
+    where
+        S: Storage<K>,
+    {
         self.should_store(key, gen, registry, MetricKind::Counter, |registry, key| {
             registry.delete_counter(key)
         })
@@ -265,12 +267,10 @@ where
     /// method will return `true` and will update the last update time internally.  If the given key
     /// has not been updated recently enough, the key will be removed from the given registry if the
     /// given generation also matches.
-    pub fn should_store_gauge(
-        &self,
-        key: &K,
-        gen: Generation,
-        registry: &Registry<K, GenerationalAtomicStorage>,
-    ) -> bool {
+    pub fn should_store_gauge<S>(&self, key: &K, gen: Generation, registry: &Registry<K, S>) -> bool
+    where
+        S: Storage<K>,
+    {
         self.should_store(key, gen, registry, MetricKind::Gauge, |registry, key| {
             registry.delete_gauge(key)
         })
@@ -282,31 +282,35 @@ where
     /// method will return `true` and will update the last update time internally.  If the given key
     /// has not been updated recently enough, the key will be removed from the given registry if the
     /// given generation also matches.
-    pub fn should_store_histogram(
+    pub fn should_store_histogram<S>(
         &self,
         key: &K,
         gen: Generation,
-        registry: &Registry<K, GenerationalAtomicStorage>,
-    ) -> bool {
+        registry: &Registry<K, S>,
+    ) -> bool
+    where
+        S: Storage<K>,
+    {
         self.should_store(key, gen, registry, MetricKind::Histogram, |registry, key| {
             registry.delete_histogram(key)
         })
     }
 
-    fn should_store<F>(
+    fn should_store<F, S>(
         &self,
         key: &K,
         gen: Generation,
-        registry: &Registry<K, GenerationalAtomicStorage>,
+        registry: &Registry<K, S>,
         kind: MetricKind,
         delete_op: F,
     ) -> bool
     where
-        F: Fn(&Registry<K, GenerationalAtomicStorage>, &K) -> bool,
+        F: Fn(&Registry<K, S>, &K) -> bool,
+        S: Storage<K>,
     {
         if let Some(idle_timeout) = self.idle_timeout {
             if self.mask.matches(kind) {
-                let mut guard = self.inner.lock();
+                let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
                 let (clock, entries) = guard.deref_mut();
 
                 let now = clock.now();

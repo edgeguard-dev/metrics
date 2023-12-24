@@ -10,88 +10,73 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Install Rust Nightly
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: nightly
-        override: true
-        components: rustfmt, clippy
+      run: rustup default nightly
     - name: Check Formatting
-      uses: actions-rs/cargo@v1
-      with:
-        command: fmt
-        args: --all -- --check
+      run: cargo fmt --all -- --check
   feature-check:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        override: true
+    - uses: actions/checkout@v3
+    - name: Install Protobuf Compiler
+      run: sudo apt-get install protobuf-compiler
+    - name: Install Rust Stable
+      run: rustup default stable
     - name: Install cargo-hack
-      uses: actions-rs/cargo@v1
+      uses: taiki-e/install-action@v2
       with:
-        command: install
-        args: cargo-hack
+        tool: cargo-hack
     - name: Check Feature Matrix
-      uses: actions-rs/cargo@v1
-      with:
-        command: hack
-        args: build --all --all-targets --feature-powerset
+      run: cargo hack check --all --all-targets --feature-powerset --release
   test:
-    name: Test ${{ matrix.rust_version }}/${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: Test ${{ matrix.rust_version }}
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        rust_version: ['1.55.0', 'stable', 'nightly']
-        os: [ubuntu-latest, windows-latest, macOS-latest]
+        rust_version: ['1.61.0', 'stable', 'nightly']
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v3
+    - name: Install Protobuf Compiler
+      run: sudo apt-get install protobuf-compiler
     - name: Install Rust ${{ matrix.rust_version }}
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: ${{ matrix.rust_version }}
-        override: true
+      run: rustup default ${{ matrix.rust_version }}
     - name: Run Tests
-      uses: actions-rs/cargo@v1
-      with:
-        command: test
-        args: --all-features --workspace --exclude=metrics-observer
+      run: cargo test --all-features --workspace --exclude=metrics-observer -- --test-threads=1
   docs:
     runs-on: ubuntu-latest
     env:
       RUSTDOCFLAGS: -Dwarnings
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
+    - name: Install Protobuf Compiler
+      run: sudo apt-get install protobuf-compiler
     - name: Install Rust Nightly
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: nightly
-        override: true
-        components: rust-docs
+      run: rustup default nightly
     - name: Check Docs
-      uses: actions-rs/cargo@v1
-      with:
-        command: doc
-        args: --all-features --workspace --exclude=metrics-observer --no-deps
+      run: cargo doc --all-features --workspace --exclude=metrics-observer --no-deps
   bench:
-    name: Bench ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: Bench
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install Protobuf Compiler
+      run: sudo apt-get install protobuf-compiler
+    - name: Install Rust Stable
+      run: rustup default stable
+    - name: Run Benchmarks
+      run: cargo bench --all-features --workspace --exclude=metrics-observer
+  clippy:
+    name: Clippy ${{ matrix.rust_version }}
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macOS-latest]
+        rust_version: ['1.61.0', 'stable', 'nightly']
     steps:
-    - uses: actions/checkout@v1
-    - name: Install Rust Stable
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        override: true
-    - name: Run Benchmarks
-      uses: actions-rs/cargo@v1
-      with:
-        command: bench
-        args: --all-features --workspace --exclude=metrics-observer
+    - uses: actions/checkout@v3
+    - name: Install Protobuf Compiler
+      run: sudo apt-get install protobuf-compiler
+    - name: Install Rust ${{ matrix.rust_version }}
+      run: rustup default ${{ matrix.rust_version }}
+    - name: Run Clippy
+      run: cargo clippy --all-features --workspace --exclude=metrics-observer

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use atomic_shim::AtomicU64;
-use metrics::{CounterFn, GaugeFn, HistogramFn};
+use metrics::{atomics::AtomicU64, CounterFn, GaugeFn, HistogramFn};
 
 use crate::AtomicBucket;
 

@@ -1,8 +1,9 @@
 [package]
 name = "metrics-util"
-version = "0.12.0"
+version = "0.15.1"
 authors = ["Toby Lawrence <toby@nuclearfurnace.com>"]
 edition = "2018"
+rust-version = "1.61.0"
 
 license = "MIT"
 
@@ -46,33 +47,33 @@ name = "bucket-crusher"
 required-features = ["handles"]
 
 [dependencies]
-metrics = { version = "^0.18", path = "../metrics" }
+metrics = { version = "^0.21", path = "../metrics" }
 crossbeam-epoch = { version = "0.9.2", default-features = false, optional = true, features = ["alloc", "std"] }
 crossbeam-utils = { version = "0.8", default-features = false, optional = true }
-atomic-shim = { version = "0.2", default-features = false, optional = true }
-aho-corasick = { version = "0.7", default-features = false, optional = true, features = ["std"] }
+aho-corasick = { version = "1", default-features = false, optional = true, features = ["std"] }
 indexmap = { version = "1", default-features = false, optional = true }
-parking_lot = { version = "0.11", default-features = false, optional = true }
-quanta = { version = "0.9.3", default-features = false, optional = true }
-sketches-ddsketch = { version = "0.1", default-features = false, optional = true }
+quanta = { version = "0.12", default-features = false, optional = true }
+sketches-ddsketch = { version = "0.2", default-features = false, optional = true }
 radix_trie = { version = "0.2", default-features = false, optional = true }
-ordered-float = { version = "2.0", default-features = false, optional = true }
+ordered-float = { version = "4.2", default-features = false, optional = true }
 num_cpus = { version = "1", default-features = false, optional = true }
-ahash = { version = "0.7", default-features = false, optional = true }
-hashbrown = { version = "0.11", default-features = false, optional = true, features = ["ahash"] }
+ahash = { version = "0.8", default-features = false, optional = true }
+hashbrown = { version = "=0.13.1", default-features = false, optional = true, features = ["ahash"] }
 
 [dev-dependencies]
 approx = "0.5"
-criterion = { version = "0.3", default-features = false, features = ["html_reports", "cargo_bench_support"] }
+criterion = { version = "=0.3.3", default-features = false }
 rand = { version = "0.8", features = ["small_rng"] }
 rand_distr = "0.4"
 getopts = "0.2"
 hdrhistogram = { version = "7.2", default-features = false }
-sketches-ddsketch = "0.1"
+sketches-ddsketch = "0.2"
 ndarray = "0.15"
 ndarray-stats = "0.5"
 noisy_float = "0.2"
-ordered-float = "2.0"
+ordered-float = "4.2"
+predicates-core = "=1.0.5"
+predicates-tree = "=1.0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
 crossbeam-queue = "0.3"
@@ -88,5 +89,5 @@ layers = ["layer-filter", "layer-router"]
 layer-filter = ["aho-corasick"]
 layer-router = ["radix_trie"]
 summary = ["sketches-ddsketch"]
-recency = ["parking_lot", "registry", "quanta"]
-registry = ["atomic-shim", "crossbeam-epoch", "crossbeam-utils", "handles", "hashbrown", "num_cpus", "parking_lot"]
+recency = ["registry", "quanta"]
+registry = ["crossbeam-epoch", "crossbeam-utils", "handles", "hashbrown", "num_cpus"]

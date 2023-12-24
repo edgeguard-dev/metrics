@@ -48,7 +48,6 @@ If you're a library author, you'll only care about using [`metrics`][metrics] to
 Overall, this repository is home to the following crates:
 
 * [`metrics`][metrics]: A lightweight metrics facade, similar to [`log`][log].
-* [`metrics-macros`][metrics-macros]: Procedural macros that power `metrics`.
 * [`metrics-tracing-context`][metrics-tracing-context]: Allow capturing [`tracing`][tracing] span
   fields as metric labels.
 * [`metrics-exporter-tcp`][metrics-exporter-tcp]: A `metrics`-compatible exporter for serving metrics over TCP.
@@ -56,17 +55,39 @@ Overall, this repository is home to the following crates:
   serving a Prometheus scrape endpoint.
 * [`metrics-util`][metrics-util]: Helper types/functions used by the `metrics` ecosystem.
 
+# community integrations
+
+As well, there are also some community-maintained exporters and other integrations:
+
+* [`metrics-exporter-statsd`][metrics-exporter-statsd]: A `metrics`-compatible exporter for sending metrics via StatsD.
+* [`metrics-exporter-newrelic`][metrics-exporter-newrelic]: A `metrics`-compatible exporter for sending metrics to New Relic.
+* [`opinionated_metrics`][opinionated-metrics]: Opinionated interface to emitting metrics for CLI/server applications, based on `metrics`.
+
+## MSRV and MSRV policy
+
+Minimum supported Rust version (MSRV) is currently **1.61.0**, enforced by CI.
+
+`metrics` will always support _at least_ the latest four versions of stable Rust, based on minor
+version releases, and excluding patch versions. Overall, we strive to support older versions where
+possible, which means that we generally try to avoid staying up-to-date with every single dependency
+(except for security/correctness reasons) and avoid bumping the MSRV just to get access to new
+helper methods in the standard library, and so on.
+
 # contributing
 
-We're always looking for users who have thoughts on how to make `metrics` better, or users with interesting use cases.  Of course, we're also happy to accept code contributions for outstanding feature requests! 😀
+To those of you who have already contributed to `metrics` in some way, shape, or form: **a big, and continued, "thank you!"** ❤️
 
-We'd love to chat about any of the above, or anything else, really!  You can find us over on [Discord](https://discord.gg/eTwKyY9).
+To everyone else that we haven't had the pleasure of interacting with: we're always looking for thoughts on how to make `metrics` better, or users with interesting use cases.  Of course, we're also happy to accept code contributions for outstanding feature requests directly. 😀
+
+We'd love to chat about any of the above, or anything else related to metrics. Don't hesitate to file an issue on the repository, or come and chat with us over on [Discord](https://discord.gg/eTwKyY9).
 
 [metrics]: https://github.com/metrics-rs/metrics/tree/main/metrics
-[metrics-macros]: https://github.com/metrics-rs/metrics/tree/main/metrics-macros
 [metrics-tracing-context]: https://github.com/metrics-rs/metrics/tree/main/metrics-tracing-context
 [metrics-exporter-tcp]: https://github.com/metrics-rs/metrics/tree/main/metrics-exporter-tcp
 [metrics-exporter-prometheus]: https://github.com/metrics-rs/metrics/tree/main/metrics-exporter-prometheus
 [metrics-util]: https://github.com/metrics-rs/metrics/tree/main/metrics-util
 [log]: https://docs.rs/log
 [tracing]: https://tracing.rs
+[metrics-exporter-statsd]: https://docs.rs/metrics-exporter-statsd
+[metrics-exporter-newrelic]: https://docs.rs/metrics-exporter-newrelic
+[opinionated-metrics]: https://docs.rs/opinionated_metrics

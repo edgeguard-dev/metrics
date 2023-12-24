@@ -1,8 +1,9 @@
 [package]
 name = "metrics-exporter-prometheus"
-version = "0.9.0"
+version = "0.12.2"
 authors = ["Toby Lawrence <toby@nuclearfurnace.com>"]
 edition = "2018"
+rust-version = "1.61.0"
 
 license = "MIT"
 
@@ -19,23 +20,25 @@ keywords = ["metrics", "telemetry", "prometheus"]
 default = ["http-listener", "push-gateway"]
 async-runtime = ["tokio", "hyper"]
 http-listener = ["async-runtime", "hyper/server", "ipnet"]
-push-gateway = ["async-runtime", "hyper/client", "tracing"]
+push-gateway = ["async-runtime", "hyper/client", "hyper-tls", "tracing"]
 
 [dependencies]
+base64 = { version = "0.21.0", default-features = false, features = ["std"] }
+indexmap = { version = "2.1", default-features = false }
+metrics = { version = "^0.21", path = "../metrics" }
+metrics-util = { version = "^0.15", path = "../metrics-util", default-features = false, features = ["recency", "registry", "summary"] }
+parking_lot = { version = "0.11", default-features = false }
+quanta = { version = "0.12", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-metrics = { version = "^0.18", path = "../metrics" }
-metrics-util = { version = "^0.12", path = "../metrics-util", default-features = false, features = ["recency", "registry", "summary"] }
-parking_lot = { version = "0.11", default-features = false }
 thiserror = { version = "1", default-features = false }
-quanta = { version = "0.9.3", default-features = false }
-indexmap = { version = "1", default-features = false }
 
 # Optional
 hyper = { version = "0.14", default-features = false, features = ["tcp", "http1"], optional = true }
 ipnet = { version = "2", optional = true }
 tokio = { version = "1", features = ["rt", "net", "time"], optional = true }
 tracing = { version = "0.1.26", optional = true }
+hyper-tls = { version = "0.5.0", optional = true }
 
 [dev-dependencies]
 tracing = "0.1"
